@@ -24,6 +24,15 @@ def _norm(item):
     return (item or "").strip().lower()
 
 
+def _norm_processo(numero):
+    if not numero:
+        return numero
+    numero = numero.strip()
+    for ch in "‐‑‒–—−":
+        numero = numero.replace(ch, "-")
+    return numero
+
+
 # ---------------------------------------------------------------------------
 # Controle de duplicidade / fila de pendências
 # ---------------------------------------------------------------------------
@@ -59,9 +68,11 @@ def fetch_pendentes(sb):
 # ---------------------------------------------------------------------------
 def find_auditoria(sb, numero_processo_anp=None, numero_relatorio=None):
     if numero_processo_anp:
-        res = sb.table("tb_auditorias").select("*").eq("numero_processo_anp", numero_processo_anp).execute()
-        if res.data:
-            return res.data[0]
+        alvo = _norm_processo(numero_processo_anp)
+        res = sb.table("tb_auditorias").select("*").execute()
+        for row in res.data:
+            if _norm_processo(row.get("numero_processo_anp")) == alvo:
+                return row
     if numero_relatorio:
         res = sb.table("tb_auditorias").select("*").ilike("numero_relatorio", f"%{numero_relatorio}%").execute()
         if res.data:
@@ -100,8 +111,10 @@ def upsert_nc(sb, id_auditoria, nc, arquivo_origem):
     if existente:
         sb.table("tb_nao_conformidades").update({
             "descricao": nc.get("descricao") or existente["descricao"],
+            "categoria_nao_conformidade": nc.get("categoria_nao_conformidade") or existente.get("categoria_nao_conformidade"),
             "norma_referencia": nc.get("norma_referencia") or existente.get("norma_referencia"),
             "classificacao_gravidade": nc.get("classificacao_gravidade") or existente.get("classificacao_gravidade"),
+            "acao_recomendada": nc.get("acao_recomendada") or existente.get("acao_recomendada"),
             "prazo_correcao": nc.get("prazo_correcao") or existente.get("prazo_correcao"),
         }).eq("id_nao_conformidade", existente["id_nao_conformidade"]).execute()
         return existente["id_nao_conformidade"]
@@ -111,8 +124,10 @@ def upsert_nc(sb, id_auditoria, nc, arquivo_origem):
         "id_auditoria": id_auditoria,
         "numero_item": nc.get("numero_item"),
         "descricao": nc.get("descricao"),
+        "categoria_nao_conformidade": nc.get("categoria_nao_conformidade"),
         "norma_referencia": nc.get("norma_referencia"),
         "classificacao_gravidade": nc.get("classificacao_gravidade"),
+        "acao_recomendada": nc.get("acao_recomendada"),
         "prazo_correcao": nc.get("prazo_correcao"),
         "status_atual": "pendente de resposta",
         "arquivo_origem": arquivo_origem,

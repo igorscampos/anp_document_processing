@@ -42,14 +42,19 @@ REGEX_PROCESSO_ANP = re.compile(r"\d{4,5}\.\d{6}/\d{4}[-‐‑‒–—−]\d{2}
 
 
 def extract_processo_regex(texto):
-    m = REGEX_PROCESSO_ANP.search(texto)
-    if m:
-        return normalize_processo(m.group(0))
-    # fallback: remove espaços/quebras de linha (comum quando o PDF quebra o
-    # número no meio) e tenta de novo
-    compacto = re.sub(r"\s+", "", texto)
-    m = REGEX_PROCESSO_ANP.search(compacto)
-    return normalize_processo(m.group(0)) if m else None
+    # Só aceita um número que apareça perto de uma âncora que indica que é o
+    # processo DESTE documento — rodapé padrão do SEI ("Processo nº ... SEI
+    # nº ...") ou "Processo Administrativo ...". Sem isso, anexos técnicos que
+    # citam processos de OUTRAS auditorias como precedente no meio do texto
+    # (ex: "conforme processo 48610.222892/2024-21...") fariam essa regex
+    # roubar um número errado e sobrescrever o que a IA extraiu corretamente.
+    for busca in (texto, re.sub(r"\s+", " ", texto)):
+        for m in REGEX_PROCESSO_ANP.finditer(busca):
+            antes = busca[max(0, m.start() - 30):m.start()].lower()
+            depois = busca[m.end():m.end() + 15].lower()
+            if "administrativo" in antes or "sei" in depois:
+                return normalize_processo(m.group(0))
+    return None
 
 
 def normalize_processo(numero):
@@ -65,27 +70,49 @@ st.set_page_config(page_title="Auditorias ANP", layout="wide")
 # ---------------------------------------------------------------------------
 # Configuração
 # ---------------------------------------------------------------------------
-def get_secret(name):
+def get_secret(name, default=None):
     if name in st.secrets:
         return st.secrets[name]
-    return os.environ.get(name)
+    return os.environ.get(name, default)
 
-ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")
 SUPABASE_URL = get_secret("SUPABASE_URL")
 SUPABASE_KEY = get_secret("SUPABASE_KEY")
-MODEL = get_secret("ANTHROPIC_MODEL") or "claude-haiku-4-5-20251001"
 
-if not (ANTHROPIC_API_KEY and SUPABASE_URL and SUPABASE_KEY):
-    st.error(
-        "Faltam credenciais. Configure ANTHROPIC_API_KEY, SUPABASE_URL e SUPABASE_KEY "
-        "em .streamlit/secrets.toml (veja secrets.toml.example)."
-    )
+# "claude" ou "ollama" — é essa a única linha que você precisa trocar para
+# alternar entre a API da Anthropic e um modelo local via Ollama.
+LLM_PROVIDER = get_secret("LLM_PROVIDER", "claude").strip().lower()
+
+ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = get_secret("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+
+OLLAMA_HOST = get_secret("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = get_secret("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+# Contexto menor por padrão para modelo local: em 16GB de memória unificada,
+# um prompt gigante empurra o KV cache além do que sobra depois do peso do
+# modelo + sistema operacional. Ajuste para cima se sua máquina aguentar.
+OLLAMA_MAX_CHARS = int(get_secret("OLLAMA_MAX_CHARS", "40000"))
+OLLAMA_NUM_CTX = int(get_secret("OLLAMA_NUM_CTX", "16384"))
+
+CLAUDE_MAX_CHARS = int(get_secret("CLAUDE_MAX_CHARS", "80000"))
+
+if not (SUPABASE_URL and SUPABASE_KEY):
+    st.error("Faltam credenciais do Supabase (SUPABASE_URL, SUPABASE_KEY) em .streamlit/secrets.toml.")
     st.stop()
 
-client = Anthropic(api_key=ANTHROPIC_API_KEY)
+if LLM_PROVIDER == "claude" and not ANTHROPIC_API_KEY:
+    st.error("LLM_PROVIDER está como 'claude', mas falta ANTHROPIC_API_KEY em .streamlit/secrets.toml.")
+    st.stop()
+
 sb = db.get_client(SUPABASE_URL, SUPABASE_KEY)
 
+_claude_client = None
+if LLM_PROVIDER == "claude":
+    from anthropic import Anthropic
+    _claude_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
 CONFIDENCE_THRESHOLD = 0.7
+MAX_CHARS = OLLAMA_MAX_CHARS if LLM_PROVIDER == "ollama" else CLAUDE_MAX_CHARS
+CURRENT_MODEL_LABEL = f"ollama:{OLLAMA_MODEL}" if LLM_PROVIDER == "ollama" else f"claude:{ANTHROPIC_MODEL}"
 
 PROMPT = """Você processa documentos de auditorias da ANP (regulação de petróleo e gás no Brasil).
 Analise o texto abaixo e responda SOMENTE com JSON válido, sem markdown, sem texto fora do JSON.
@@ -101,11 +128,33 @@ Formato exato:
   "respostas": []
 }}
 
-Preencha "auditoria" (objeto com operadora, cnpj_operadora, unidade_instalacao, tipo_auditoria,
-data_auditoria_inicio, data_auditoria_fim, data_emissao_relatorio, auditor_responsavel,
-status_auditoria) e "nao_conformidades" (array de {{numero_item, descricao, norma_referencia,
-classificacao_gravidade, prazo_correcao}}) SOMENTE se tipo_documento for auditoria_oficial.
-O anexo técnico de uma auditoria também conta como auditoria_oficial.
+Preencha "auditoria" (objeto com codigo_auditoria_anp, ordem_servico, operadora, cnpj_operadora,
+unidade_instalacao, tipo_auditoria, sumario_auditoria, acao_demandada, data_auditoria_inicio,
+data_auditoria_fim, data_emissao_relatorio, auditor_responsavel, status_auditoria, resultado_final)
+e "nao_conformidades" (array de {{numero_item, descricao, categoria_nao_conformidade,
+norma_referencia, classificacao_gravidade, acao_recomendada, prazo_correcao}}) SOMENTE se
+tipo_documento for auditoria_oficial. O anexo técnico de uma auditoria também conta como
+auditoria_oficial.
+
+Detalhe de cada campo novo de "auditoria":
+- codigo_auditoria_anp: identificador interno da própria ANP para a auditoria, geralmente no
+  formato "NNN_SSO_AAAA" (ex: "027_SSO_2025"), citado como "Auditoria 027_SSO_2025" no texto.
+  Diferente do número do processo administrativo e do número do relatório/DF.
+- ordem_servico: número da Ordem de Serviço, geralmente no cabeçalho do documento (ex: "OS SSO_002725").
+- sumario_auditoria: resumo em até 40 palavras do que a auditoria constatou/tratou.
+- acao_demandada: a medida cautelar ou ação exigida pela ANP como resultado da auditoria (ex:
+  "Interdição da operação com hidrocarbonetos até saneamento das notificações"), em até 30 palavras.
+- resultado_final: a conclusão/status final da auditoria SE o documento deixar isso claro (ex:
+  "interditada", "liberada para operação"); use null se não houver essa informação.
+
+Detalhe de cada campo novo de "nao_conformidades":
+- categoria_nao_conformidade: área temática do item (ex: "Gestão de risco", "Sistema de drenagem",
+  "Integridade estrutural", "Comunicação", "Atmosfera explosiva"), em 2-4 palavras.
+- acao_recomendada: a ação que a ANP exige da operadora para sanar especificamente este item,
+  em até 20 palavras (geralmente o próprio texto da notificação, ex: "Refazer o estudo de
+  dispersão de gases considerando condição de calmaria").
+
+Preencha "respostas" (array de {{numero_item, resultado_final, decisao_anp, resumo}}) SOMENTE se
 
 ATENÇÃO — numeração dos itens em Documentos de Fiscalização da ANP: é comum o documento ter DUAS
 listas sobre os mesmos assuntos, com numerações diferentes:
@@ -124,6 +173,8 @@ tipo_documento for resposta_operadora ou parecer_anp. numero_item deve correspon
 número usado pelo próprio documento ao citar a não conformidade/condicionante (ex: "5.4"). resumo
 em até 25 palavras.
 
+Responda APENAS o JSON, começando com {{ e terminando com }}, sem nenhum texto antes ou depois.
+
 TEXTO DO DOCUMENTO (pode estar truncado):
 ---
 {texto}
@@ -132,9 +183,10 @@ TEXTO DO DOCUMENTO (pode estar truncado):
 
 
 # ---------------------------------------------------------------------------
-# Extração de texto e chamada à IA
+# Extração de texto
 # ---------------------------------------------------------------------------
-def extract_text(file_bytes, max_chars=80000):
+def extract_text(file_bytes, max_chars=None):
+    max_chars = max_chars or MAX_CHARS
     parts = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -142,17 +194,54 @@ def extract_text(file_bytes, max_chars=80000):
     return "\n".join(parts)[:max_chars]
 
 
-def classify_and_extract(texto):
-    msg = client.messages.create(
-        model=MODEL,
-        max_tokens=2000,
-        messages=[{"role": "user", "content": PROMPT.format(texto=texto)}],
-    )
-    raw = "".join(b.text for b in msg.content if b.type == "text").strip()
-    raw = raw.strip("`")
+# ---------------------------------------------------------------------------
+# Camada de LLM — troque LLM_PROVIDER no secrets para alternar entre os dois
+# ---------------------------------------------------------------------------
+def _clean_json_text(raw):
+    raw = raw.strip().strip("`")
     if raw.lower().startswith("json"):
         raw = raw[4:].strip()
-    return json.loads(raw)
+    # alguns modelos locais "conversam" antes/depois do JSON mesmo quando
+    # instruídos a não fazer isso — corta para o primeiro { e o último }
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end != -1:
+        raw = raw[start:end + 1]
+    return raw
+
+
+def _call_claude(prompt):
+    msg = _claude_client.messages.create(
+        model=ANTHROPIC_MODEL,
+        # Documentos de auditoria reais costumam ter 10-40+ não conformidades,
+        # cada uma com vários campos — 2000 tokens cortava o JSON no meio e
+        # quebrava com JSONDecodeError antes mesmo de salvar qualquer coisa.
+        max_tokens=8000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return "".join(b.text for b in msg.content if b.type == "text")
+
+
+def _call_ollama(prompt):
+    import requests
+    resp = requests.post(
+        f"{OLLAMA_HOST}/api/generate",
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0, "num_ctx": OLLAMA_NUM_CTX},
+        },
+        timeout=300,
+    )
+    resp.raise_for_status()
+    return resp.json()["response"]
+
+
+def classify_and_extract(texto):
+    prompt = PROMPT.format(texto=texto)
+    raw = _call_ollama(prompt) if LLM_PROVIDER == "ollama" else _call_claude(prompt)
+    return json.loads(_clean_json_text(raw))
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +373,25 @@ def process_uploaded_file(uploaded_file, force=False):
 # Interface
 # ---------------------------------------------------------------------------
 st.title("Painel de auditorias ANP")
-st.caption(f"Classificação e extração via Claude ({MODEL}) · banco Supabase · upload em qualquer ordem")
+st.caption(f"Classificação e extração via {CURRENT_MODEL_LABEL} · banco Supabase · upload em qualquer ordem")
+
+if LLM_PROVIDER == "ollama":
+    try:
+        import requests
+        tags = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=3).json().get("models", [])
+        nomes = [m["name"] for m in tags]
+        if not any(OLLAMA_MODEL.split(":")[0] in n for n in nomes):
+            st.warning(
+                f"Ollama está rodando em {OLLAMA_HOST}, mas o modelo '{OLLAMA_MODEL}' não "
+                f"aparece na lista de modelos baixados ({nomes or 'nenhum'}). "
+                f"Rode: `ollama pull {OLLAMA_MODEL}`"
+            )
+    except Exception:
+        st.error(
+            f"Não consegui conectar ao Ollama em {OLLAMA_HOST}. Confirme que ele está rodando "
+            f"(`ollama serve` ou abra o app Ollama) e que OLLAMA_HOST está correto."
+        )
+        st.stop()
 
 uploaded_files = st.file_uploader(
     "Envie PDFs de auditoria, resposta ou parecer — em qualquer ordem, um de cada vez ou em lote",
