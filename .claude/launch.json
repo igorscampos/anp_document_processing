@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "streamlit-app",
+      "runtimeExecutable": "C:\\Users\\Igor Campos\\programming\\anp_document_processing\\venv\\Scripts\\streamlit.exe",
+      "runtimeArgs": ["run", "streamlit_app.py", "--server.headless", "true", "--server.port", "8511"],
+      "port": 8511
+    }
+  ]
+}

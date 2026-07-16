@@ -1,0 +1,115 @@
+{
+  "tipo_documento": "auditoria_oficial",
+  "confianca": 0.98,
+  "numero_processo_anp": "48610.229661/2024-49",
+  "numero_relatorio": null,
+  "auditoria": {
+    "codigo_auditoria_anp": "035_SSO_2024",
+    "ordem_servico": null,
+    "operadora": "PETRÓLEO BRASILEIRO S/A",
+    "cnpj_operadora": "33.000.167/0001-01",
+    "unidade_instalacao": "BÚZIOS N/A",
+    "tipo_auditoria": "Boletim de Fiscalização, Auto de Infração, Auto de Interdição e Notificação",
+    "sumario_auditoria": "Fiscalização da Petrobras em Búzios identificando falhas críticas em testes ESDV, gestão de risco com equipamentos degradados e inibição repetida de sensores F&G. Aplicadas interdições parciais e notificações para correção.",
+    "acao_demandada": "Restaurar funcionalidade dos instrumentos críticos, apresentar justificativas técnicas para desvios e relatórios semanais sobre a célula de inibição até 21/11/2024.",
+    "data_auditoria_inicio": "12/11/2024",
+    "data_auditoria_fim": "19/11/2024",
+    "data_emissao_relatorio": "19/11/2024",
+    "auditor_responsavel": "Elson Meneses Correia",
+    "status_auditoria": "Interditada (parcialmente)",
+    "resultado_final": null
+  },
+  "nao_conformidades": [
+    {
+      "numero_item": "5.1",
+      "descricao": "Retornar a operação das ESDVs da P-74 'SDV-1210001B', 'SDV-1210001D', 'SDV-1210001P', 'SDV-1210001R', 'SDV-1210002F' e 'SDV-1231027-1'.",
+      "categoria_nao_conformidade": "Sistemas de Segurança",
+      "norma_referencia": "Resolução ANP nº 43/2007, item 13.3.4",
+      "classificacao_gravidade": "Grave Iminente (RGI)",
+      "acao_recomendada": "Restaurar a operação das válvulas ESDV listadas imediatamente.",
+      "prazo_correcao": null
+    },
+    {
+      "numero_item": "5.2",
+      "descricao": "Apresentar justificativa técnica para todas as ESDVs que apresentaram tempo de fechamento maior que 1,5 seg/pol e comprovar tecnicamente premissas.",
+      "categoria_nao_conformidade": "Sistemas de Segurança",
+      "norma_referencia": "Resolução ANP nº 43/2007",
+      "classificacao_gravidade": "Grave Iminente (RGI)",
+      "acao_recomendada": "Apresentar estudo complementar comprovando premissas e cálculos dos testes de fechamento.",
+      "prazo_correcao": null
+    },
+    {
+      "numero_item": "5.3",
+      "descricao": "Justificar a informação sobre Heberton Souto Moreira não ter sido aprovado fora dos critérios do estudo de propagação de incêndio.",
+      "categoria_nao_conformidade": "Gestão de Risco",
+      "norma_referencia": "Resolução ANP nº 43/2007, item 13.3.4",
+      "classificacao_gravidade": "Grave Iminente (RGI)",
+      "acao_recomendada": "Apresentar justificativa para a informação sobre aprovação de testes fora dos critérios.",
+      "prazo_correcao": null
+    },
+    {
+      "numero_item": "5.4",
+      "descricao": "Apresentar todos os testes de lógicas realizados em virtude de alteração de lógica devido à degradação de equipamentos críticos.",
+      "categoria_nao_conformidade": "Gestão de Risco",
+      "norma_referencia": "R01 da investigação do incidente P-19",
+      "classificacao_gravidade": "Grave Iminente (RGI)",
+      "acao_recomendada": "Apresentar todos os testes de lógica realizados após alteração devido à degradação.",
+      "prazo_correcao": null
+    },
+    {
+      "numero_item": "5.5",
+      "descricao": "Listar todos os equipamentos e instrumentos degradados ou fora de operação, incluindo a data que saíram da operação.",
+      "categoria_nao_conformidade": "Gestão de Risco",
+      "norma_referencia": "Resolução ANP nº 43/2007",
+      "classificacao_gravidade": "Grave Iminente (RGI)",
+      "acao_recomendada": "Apresentar lista completa de equipamentos degradados com datas de saída da operação.",
+      "prazo_correcao": null
+    },
+    {
+      "numero_item": "5.6",
+      "descricao": "Apresentar estudos adequados para a gestão de risco de todos os equipamentos críticos relacionados a cenários de grandeza e frequência.",
+      "categoria_nao_conformidade": "Gestão de Risco",
+      "norma_referencia": "Resolução ANP nº 43/2007, item 13.3.4",
+      "classificacao_gravidade": "Grave Iminente (RGI)",
+      "acao_recomendada": "Apresentar estudos de gestão de risco para todos os equipamentos críticos.",
+      "prazo_correcao": null
+    },
+    {
+      "numero_item": "5.7",
+      "descricao": "Realizar reunião às 10h do dia 21/11/2024 para discussão final sobre a situação de risco das instalações.",
+      "categoria_nao_conformidade": "Comunicação e Gestão",
+      "norma_referencia": null,
+      "classificacao_gravidade": "Média",
+      "acao_recomendada": "Realizar reunião técnica para discussão final da situação de risco.",
+      "prazo_correcao": null
+    },
+    {
+      "numero_item": "5.8",
+      "descricao": "Restaurar a funcionalidade de todos os instrumentos críticos das plataformas P-74/75/76 e 77 num prazo de 45 dias.",
+      "categoria_nao_conformidade": "Integridade Estrutural",
+      "norma_referencia": null,
+      "classificacao_gravidade": "Grave Iminente (RGI)",
+      "acao_recomendada": "Restaurar a funcionalidade de todos os instrumentos críticos em 45 dias.",
+      "prazo_correcao": null
+    },
+    {
+      "numero_item": "5.9",
+      "descricao": "Apresentar relatório semanal sobre os trabalhos da célula de inibição, desvios e controle das inibições realizadas.",
+      "categoria_nao_conformidade": "Gestão de Risco",
+      "norma_referencia": null,
+      "classificacao_gravidade": "Média",
+      "acao_recomendada": "Enviar relatório semanal sobre a célula de inibição e controle das inibições.",
+      "prazo_correcao": null
+    },
+    {
+      "numero_item": "5.10",
+      "descricao": "Operar o sistema de tratamento de água apenas após implementação integral do relatório RL-301 O. OF-1223-814-P4X-002 e anuência da ANP.",
+      "categoria_nao_conformidade": "Sistemas Auxiliares",
+      "norma_referencia": null,
+      "classificacao_gravidade": "Grave Iminente (RGI)",
+      "acao_recomendada": "Operar o sistema de tratamento de água apenas após implementação do relatório RL-301.",
+      "prazo_correcao": null
+    }
+  ],
+  "respostas": []
+}

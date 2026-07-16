@@ -64,6 +64,26 @@ def fetch_pendentes(sb):
 
 
 # ---------------------------------------------------------------------------
+# tb_lotes_batch — processamento em lote via Batch API da Anthropic
+# ---------------------------------------------------------------------------
+def upsert_lote_batch(sb, id_lote, status, total_itens, itens_json):
+    sb.table("tb_lotes_batch").upsert({
+        "id_lote": id_lote,
+        "status": status,
+        "total_itens": total_itens,
+        "itens_json": itens_json,
+    }).execute()
+
+
+def fetch_lotes_batch(sb, status_excluir=None):
+    res = sb.table("tb_lotes_batch").select("*").order("criado_em", desc=True).execute()
+    dados = res.data
+    if status_excluir:
+        dados = [l for l in dados if l["status"] != status_excluir]
+    return dados
+
+
+# ---------------------------------------------------------------------------
 # tb_auditorias
 # ---------------------------------------------------------------------------
 def find_auditoria(sb, numero_processo_anp=None, numero_relatorio=None):

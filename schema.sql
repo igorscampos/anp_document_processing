@@ -71,10 +71,25 @@ create table if not exists tb_arquivos_processados (
     atualizado_em timestamptz default now()
 );
 
+-- Controla lotes enviados à Batch API da Anthropic (upload de ZIP com várias
+-- pastas de processo, uma por processo de auditoria) — permite conferir o
+-- status depois de fechar a aba e aplicar os resultados só quando o lote
+-- estiver pronto (a Batch API pode levar até 24h, embora a maioria termine
+-- em menos de 1h).
+create table if not exists tb_lotes_batch (
+    id_lote text primary key,        -- id do batch na Anthropic (msgbatch_...)
+    status text,                     -- 'in_progress' | 'canceling' | 'ended' | 'concluido'
+    total_itens integer,
+    itens_json jsonb,                -- custom_id -> {nome_arquivo, hash_arquivo, pasta_processo, tipo_sei, decisao_catalogo, numero_processo_regex, numero_processo_pasta}
+    criado_em timestamptz default now(),
+    atualizado_em timestamptz default now()
+);
+
 alter table tb_auditorias disable row level security;
 alter table tb_nao_conformidades disable row level security;
 alter table tb_respostas disable row level security;
 alter table tb_arquivos_processados disable row level security;
+alter table tb_lotes_batch disable row level security;
 
 -- ---------------------------------------------------------------------
 -- ALTER: rode isto se você já tinha a versão anterior do schema aplicada
@@ -88,3 +103,12 @@ alter table tb_arquivos_processados disable row level security;
 -- alter table tb_auditorias add column if not exists resultado_final text;
 -- alter table tb_nao_conformidades add column if not exists categoria_nao_conformidade text;
 -- alter table tb_nao_conformidades add column if not exists acao_recomendada text;
+-- create table if not exists tb_lotes_batch (
+--     id_lote text primary key,
+--     status text,
+--     total_itens integer,
+--     itens_json jsonb,
+--     criado_em timestamptz default now(),
+--     atualizado_em timestamptz default now()
+-- );
+-- alter table tb_lotes_batch disable row level security;

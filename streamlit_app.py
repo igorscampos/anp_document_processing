@@ -20,50 +20,24 @@ import hashlib
 import io
 import json
 import os
-import re
+import pathlib
+import zipfile
 
-import pdfplumber
 import streamlit as st
 from anthropic import Anthropic
+from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+from anthropic.types.messages.batch_create_params import Request
 
 import db
-
-# Número de processo da ANP segue um formato fixo (ex: 48610.221768/2025-20).
-# Extrair por regex direto do texto é mais confiável do que depender da IA
-# "adivinhar" qual número do documento é o processo — evita que documentos do
-# mesmo processo fiquem com o campo escrito de formas ligeiramente diferentes
-# e, por isso, não se vinculem entre si.
-#
-# A classe [-‐‑‒–—−] cobre o hífen comum e os travessões "parecidos" que PDFs
-# às vezes usam (en-dash, non-breaking hyphen etc.) — sem isso, dois
-# documentos do mesmo processo podem extrair o número com traços diferentes
-# e nunca dar match.
-REGEX_PROCESSO_ANP = re.compile(r"\d{4,5}\.\d{6}/\d{4}[-‐‑‒–—−]\d{2}")
-
-
-def extract_processo_regex(texto):
-    # Só aceita um número que apareça perto de uma âncora que indica que é o
-    # processo DESTE documento — rodapé padrão do SEI ("Processo nº ... SEI
-    # nº ...") ou "Processo Administrativo ...". Sem isso, anexos técnicos que
-    # citam processos de OUTRAS auditorias como precedente no meio do texto
-    # (ex: "conforme processo 48610.222892/2024-21...") fariam essa regex
-    # roubar um número errado e sobrescrever o que a IA extraiu corretamente.
-    for busca in (texto, re.sub(r"\s+", " ", texto)):
-        for m in REGEX_PROCESSO_ANP.finditer(busca):
-            antes = busca[max(0, m.start() - 30):m.start()].lower()
-            depois = busca[m.end():m.end() + 15].lower()
-            if "administrativo" in antes or "sei" in depois:
-                return normalize_processo(m.group(0))
-    return None
-
-
-def normalize_processo(numero):
-    if not numero:
-        return numero
-    # unifica qualquer variação de travessão para o hífen comum
-    for ch in "‐‑‒–—−":
-        numero = numero.replace(ch, "-")
-    return numero.strip()
+import pipeline
+from pipeline import (
+    extract_processo_regex,
+    normalize_processo,
+    extract_text as _pipeline_extract_text,
+    doc_id_from_filename,
+    classify_catalog_entry,
+    load_catalog,
+)
 
 st.set_page_config(page_title="Auditorias ANP", layout="wide")
 
@@ -92,6 +66,12 @@ OLLAMA_MODEL = get_secret("OLLAMA_MODEL", "qwen2.5:7b-instruct")
 # modelo + sistema operacional. Ajuste para cima se sua máquina aguentar.
 OLLAMA_MAX_CHARS = int(get_secret("OLLAMA_MAX_CHARS", "40000"))
 OLLAMA_NUM_CTX = int(get_secret("OLLAMA_NUM_CTX", "16384"))
+OLLAMA_NUM_PREDICT = int(get_secret("OLLAMA_NUM_PREDICT", "4096"))
+# Modelos de "raciocínio" (qwen3, qwen3.5, deepseek-r1 etc.) mandam a resposta
+# inteira para o campo "thinking" do Ollama e deixam "response" vazio quando o
+# pensamento não é desligado — o JSON nunca chegava a ser gerado no campo que
+# o código lia. "think: false" faz o modelo responder direto no campo certo.
+OLLAMA_THINK = get_secret("OLLAMA_THINK", "false").strip().lower() in ("true", "1", "yes")
 
 CLAUDE_MAX_CHARS = int(get_secret("CLAUDE_MAX_CHARS", "80000"))
 
@@ -114,84 +94,8 @@ CONFIDENCE_THRESHOLD = 0.7
 MAX_CHARS = OLLAMA_MAX_CHARS if LLM_PROVIDER == "ollama" else CLAUDE_MAX_CHARS
 CURRENT_MODEL_LABEL = f"ollama:{OLLAMA_MODEL}" if LLM_PROVIDER == "ollama" else f"claude:{ANTHROPIC_MODEL}"
 
-PROMPT = """Você processa documentos de auditorias da ANP (regulação de petróleo e gás no Brasil).
-Analise o texto abaixo e responda SOMENTE com JSON válido, sem markdown, sem texto fora do JSON.
-
-Formato exato:
-{{
-  "tipo_documento": "auditoria_oficial|resposta_operadora|parecer_anp|evidencia_anexa|indeterminado",
-  "confianca": 0.0,
-  "numero_processo_anp": "string ou null",
-  "numero_relatorio": "string ou null",
-  "auditoria": null,
-  "nao_conformidades": [],
-  "respostas": []
-}}
-
-Preencha "auditoria" (objeto com codigo_auditoria_anp, ordem_servico, operadora, cnpj_operadora,
-unidade_instalacao, tipo_auditoria, sumario_auditoria, acao_demandada, data_auditoria_inicio,
-data_auditoria_fim, data_emissao_relatorio, auditor_responsavel, status_auditoria, resultado_final)
-e "nao_conformidades" (array de {{numero_item, descricao, categoria_nao_conformidade,
-norma_referencia, classificacao_gravidade, acao_recomendada, prazo_correcao}}) SOMENTE se
-tipo_documento for auditoria_oficial. O anexo técnico de uma auditoria também conta como
-auditoria_oficial.
-
-Detalhe de cada campo novo de "auditoria":
-- codigo_auditoria_anp: identificador interno da própria ANP para a auditoria, geralmente no
-  formato "NNN_SSO_AAAA" (ex: "027_SSO_2025"), citado como "Auditoria 027_SSO_2025" no texto.
-  Diferente do número do processo administrativo e do número do relatório/DF.
-- ordem_servico: número da Ordem de Serviço, geralmente no cabeçalho do documento (ex: "OS SSO_002725").
-- sumario_auditoria: resumo em até 40 palavras do que a auditoria constatou/tratou.
-- acao_demandada: a medida cautelar ou ação exigida pela ANP como resultado da auditoria (ex:
-  "Interdição da operação com hidrocarbonetos até saneamento das notificações"), em até 30 palavras.
-- resultado_final: a conclusão/status final da auditoria SE o documento deixar isso claro (ex:
-  "interditada", "liberada para operação"); use null se não houver essa informação.
-
-Detalhe de cada campo novo de "nao_conformidades":
-- categoria_nao_conformidade: área temática do item (ex: "Gestão de risco", "Sistema de drenagem",
-  "Integridade estrutural", "Comunicação", "Atmosfera explosiva"), em 2-4 palavras.
-- acao_recomendada: a ação que a ANP exige da operadora para sanar especificamente este item,
-  em até 20 palavras (geralmente o próprio texto da notificação, ex: "Refazer o estudo de
-  dispersão de gases considerando condição de calmaria").
-
-Preencha "respostas" (array de {{numero_item, resultado_final, decisao_anp, resumo}}) SOMENTE se
-
-ATENÇÃO — numeração dos itens em Documentos de Fiscalização da ANP: é comum o documento ter DUAS
-listas sobre os mesmos assuntos, com numerações diferentes:
-  (a) uma seção descritiva/técnica (ex: "3-AUTO DE INTERDIÇÃO", itens "3.1", "3.2", "3.4"...),
-      com o detalhamento de cada problema encontrado;
-  (b) uma seção de NOTIFICAÇÃO formal (ex: "5-NOTIFICAÇÃO", itens "5.1", "5.4", "5.6"...), que
-      instrui a operadora a comprovar/corrigir/apresentar evidências sobre cada assunto.
-As respostas da operadora e os pareceres da ANP SEMPRE referenciam a numeração da seção (b), a de
-NOTIFICAÇÃO. Portanto, o campo "numero_item" de cada não conformidade DEVE usar o número da seção
-de notificação formal (ex: "5.4"), mesmo que você use o texto da seção descritiva (a) para preencher
-"descricao" com mais detalhe. Nunca use a numeração da seção descritiva (ex: "3.1") como numero_item
-se existir uma seção de notificação formal correspondente no mesmo documento.
-
-Preencha "respostas" (array de {{numero_item, resultado_final, decisao_anp, resumo}}) SOMENTE se
-tipo_documento for resposta_operadora ou parecer_anp. numero_item deve corresponder exatamente ao
-número usado pelo próprio documento ao citar a não conformidade/condicionante (ex: "5.4"). resumo
-em até 25 palavras.
-
-Responda APENAS o JSON, começando com {{ e terminando com }}, sem nenhum texto antes ou depois.
-
-TEXTO DO DOCUMENTO (pode estar truncado):
----
-{texto}
----
-"""
-
-
-# ---------------------------------------------------------------------------
-# Extração de texto
-# ---------------------------------------------------------------------------
 def extract_text(file_bytes, max_chars=None):
-    max_chars = max_chars or MAX_CHARS
-    parts = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            parts.append(page.extract_text() or "")
-    return "\n".join(parts)[:max_chars]
+    return _pipeline_extract_text(file_bytes, max_chars or MAX_CHARS)
 
 
 # ---------------------------------------------------------------------------
@@ -230,16 +134,26 @@ def _call_ollama(prompt):
             "prompt": prompt,
             "stream": False,
             "format": "json",
-            "options": {"temperature": 0, "num_ctx": OLLAMA_NUM_CTX},
+            "think": OLLAMA_THINK,
+            "options": {"temperature": 0, "num_ctx": OLLAMA_NUM_CTX, "num_predict": OLLAMA_NUM_PREDICT},
         },
         timeout=300,
     )
     resp.raise_for_status()
-    return resp.json()["response"]
+    data = resp.json()
+    texto = data.get("response") or ""
+    if not texto.strip():
+        # Modelo de raciocínio "vazou" tudo pro campo thinking mesmo com
+        # think=false (acontece se o Ollama instalado for antigo e ignorar
+        # o parâmetro) — melhor avisar claramente do que devolver um erro
+        # genérico de JSON inválido.
+        pista = " (o modelo pensou mas não respondeu — tente atualizar o Ollama ou trocar de modelo)" if data.get("thinking") else ""
+        raise ValueError(f"Ollama devolveu resposta vazia para o modelo '{OLLAMA_MODEL}'{pista}.")
+    return texto
 
 
-def classify_and_extract(texto):
-    prompt = PROMPT.format(texto=texto)
+def classify_and_extract(texto, tipo_sei=None):
+    prompt = pipeline.build_prompt(texto, tipo_sei=tipo_sei)
     raw = _call_ollama(prompt) if LLM_PROVIDER == "ollama" else _call_claude(prompt)
     return json.loads(_clean_json_text(raw))
 
@@ -312,38 +226,37 @@ def retry_pending_queue():
 # ---------------------------------------------------------------------------
 # Processamento de um upload
 # ---------------------------------------------------------------------------
-def process_uploaded_file(uploaded_file, force=False):
-    file_bytes = uploaded_file.getvalue()
-    file_hash = hashlib.sha256(file_bytes).hexdigest()
+def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, numero_override=None):
+    """Aplica overrides determinísticos, o gate de confiança e grava o resultado.
 
-    existing = db.already_processed(sb, file_hash)
-    if existing and existing["status"] in ("concluido", "revisao_manual", "erro") and not force:
-        return "duplicado", f"já processado antes ({existing['status']}) — marque 'forçar reprocessamento' para refazer"
-
-    texto = extract_text(file_bytes)
-    if not texto.strip():
-        db.upsert_arquivo_status(sb, file_hash, uploaded_file.name, None, 0.0, "erro", "sem texto extraível (pode precisar de OCR)")
-        return "erro", "sem texto extraível (pode precisar de OCR)"
-
-    result = classify_and_extract(texto)
+    Compartilhado entre o processamento síncrono (upload direto, 1 chamada de
+    API por arquivo) e a aplicação de resultados de um lote da Batch API — a
+    única diferença entre os dois fluxos é como "result" (JSON já classificado
+    pela IA) chegou até aqui; a partir daqui a lógica de vínculo é idêntica.
+    """
     tipo = result["tipo_documento"]
 
-    # Override determinístico: se o texto contém um número de processo ANP no
-    # formato padrão, usa ele em vez do que a IA extraiu — garante que
-    # documentos do mesmo processo sempre casem entre si.
-    numero_regex = extract_processo_regex(texto)
-    if numero_regex:
-        result["numero_processo_anp"] = numero_regex
+    # Override determinístico: o catálogo do SEI já classificou este documento
+    # como Documento de Fiscalização (ou peça oficial equivalente) — não
+    # depende da IA acertar isso, e ignora o gate de confiança abaixo.
+    if decisao_catalogo == "prioritario":
+        tipo = result["tipo_documento"] = "auditoria_oficial"
 
-    if result["confianca"] < CONFIDENCE_THRESHOLD or tipo in ("indeterminado", "evidencia_anexa"):
-        db.upsert_arquivo_status(sb, file_hash, uploaded_file.name, tipo, result["confianca"], "revisao_manual", "confiança baixa ou tipo não processável automaticamente")
+    # Override determinístico: número de processo ANP já resolvido (regex no
+    # texto, ou fallback do nome da pasta no processamento em lote) — garante
+    # que documentos do mesmo processo sempre casem entre si.
+    if numero_override:
+        result["numero_processo_anp"] = numero_override
+
+    if decisao_catalogo != "prioritario" and (result["confianca"] < CONFIDENCE_THRESHOLD or tipo in ("indeterminado", "evidencia_anexa")):
+        db.upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo, result["confianca"], "revisao_manual", "confiança baixa ou tipo não processável automaticamente")
         return "revisao", f"confiança {result['confianca']:.2f} — tipo {tipo}"
 
     processo_label = f" [processo {result.get('numero_processo_anp') or '—'}]"
 
     if tipo == "auditoria_oficial":
-        id_auditoria, n = apply_auditoria(result, uploaded_file.name)
-        db.upsert_arquivo_status(sb, file_hash, uploaded_file.name, tipo, result["confianca"], "concluido", f"auditoria {id_auditoria}")
+        id_auditoria, n = apply_auditoria(result, nome_arquivo)
+        db.upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo, result["confianca"], "concluido", f"auditoria {id_auditoria}")
         resolvidos = retry_pending_queue()
         detalhe = f"auditoria {id_auditoria} atualizada com {n} não conformidade(s){processo_label}"
         if resolvidos:
@@ -353,7 +266,7 @@ def process_uploaded_file(uploaded_file, force=False):
     # resposta_operadora ou parecer_anp
     status, pendentes, msg = try_apply_respostas(
         result.get("numero_processo_anp"), result.get("numero_relatorio"),
-        result.get("respostas", []), tipo, uploaded_file.name,
+        result.get("respostas", []), tipo, nome_arquivo,
     )
     msg += processo_label
     payload = None
@@ -364,9 +277,200 @@ def process_uploaded_file(uploaded_file, force=False):
             "numero_relatorio": result.get("numero_relatorio"),
             "respostas": pendentes,
         }
-    db.upsert_arquivo_status(sb, file_hash, uploaded_file.name, tipo, result["confianca"], status, msg, payload)
+    db.upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo, result["confianca"], status, msg, payload)
     status_label = {"concluido": "concluido", "parcial": "revisao", "pendente_vinculo": "revisao"}[status]
     return status_label, msg
+
+
+def process_uploaded_file(uploaded_file, catalogo=None, force=False):
+    file_bytes = uploaded_file.getvalue()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    existing = db.already_processed(sb, file_hash)
+    if existing and existing["status"] in ("concluido", "revisao_manual", "erro", "descartado") and not force:
+        return "duplicado", f"já processado antes ({existing['status']}) — marque 'forçar reprocessamento' para refazer"
+
+    # Catálogo do SEI (CSV): decide ANTES de gastar tokens se o arquivo deve
+    # ser descartado (erro de captura ou tipo sem conteúdo de auditoria), ou
+    # se já sabemos com certeza que é o Documento de Fiscalização (ou peça
+    # oficial equivalente) — nesse caso o tipo final é forçado, não depende
+    # da IA acertar a classificação.
+    doc_id = doc_id_from_filename(uploaded_file.name)
+    entry = (catalogo or {}).get(doc_id)
+    decisao_catalogo = classify_catalog_entry(entry)
+
+    if decisao_catalogo == "descartar":
+        motivo = (
+            f"descartado pelo catálogo SEI — tipo '{entry['tipo_documento']}'"
+            if entry and entry["status"].strip().lower() == "sucesso"
+            else f"descartado pelo catálogo SEI — status de captura '{entry['status']}'" if entry
+            else "descartado"
+        )
+        db.upsert_arquivo_status(sb, file_hash, uploaded_file.name, entry.get("tipo_documento") if entry else None, 1.0, "descartado", motivo)
+        return "descartado", motivo
+
+    texto = extract_text(file_bytes)
+    if not texto.strip():
+        db.upsert_arquivo_status(sb, file_hash, uploaded_file.name, None, 0.0, "erro", "sem texto extraível (pode precisar de OCR)")
+        return "erro", "sem texto extraível (pode precisar de OCR)"
+
+    tipo_sei = entry["tipo_documento"] if entry else None
+    result = classify_and_extract(texto, tipo_sei=tipo_sei)
+    numero_regex = extract_processo_regex(texto)
+
+    return finalize_result(result, file_hash, uploaded_file.name, decisao_catalogo, numero_override=numero_regex)
+
+
+# ---------------------------------------------------------------------------
+# Processamento em lote (ZIP + Batch API) — funcionalidade nova, independente
+# do upload direto acima. Cada pasta de 1º nível dentro do ZIP é 1 processo de
+# auditoria; todos os PDFs "processáveis" (após o filtro do catálogo) do ZIP
+# inteiro viram uma única submissão à Batch API da Anthropic — metade do
+# custo por token do processamento síncrono, em troca de latência maior
+# (a Batch API normalmente termina em menos de 1h, mas pode levar até 24h).
+# ---------------------------------------------------------------------------
+def _iter_zip_pdfs(zip_bytes):
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            caminho = pathlib.PurePosixPath(info.filename)
+            if caminho.suffix.lower() != ".pdf":
+                continue
+            # ignora lixo comum de export de zip (metadados do macOS, ocultos)
+            if any(parte.startswith(".") or parte == "__MACOSX" for parte in caminho.parts):
+                continue
+            # usa a pasta MAIS PRÓXIMA do arquivo como "processo" — funciona
+            # tanto para "processo/arquivo.pdf" quanto para o aninhamento
+            # duplicado comum em exports de zip ("processo/processo/arquivo.pdf")
+            pasta_processo = caminho.parent.name or "sem_pasta"
+            yield pasta_processo, caminho.name, zf.read(info)
+
+
+def prepare_batch_from_zip(zip_bytes, catalogo, force=False):
+    """Varre o ZIP e monta as requisições da Batch API.
+
+    Descarta, marca erro ou duplicado imediatamente (sem gastar tokens) — só
+    os documentos que realmente precisam da IA entram no lote. Retorna
+    (lista_de_requests, itens{custom_id: detalhes}, contagem).
+    """
+    batch_requests = []
+    itens = {}
+    contagem = {"descartado": 0, "erro": 0, "duplicado": 0, "enviado": 0}
+
+    for i, (pasta_processo, nome_arquivo, file_bytes) in enumerate(_iter_zip_pdfs(zip_bytes)):
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        existing = db.already_processed(sb, file_hash)
+        if existing and existing["status"] in ("concluido", "revisao_manual", "erro", "descartado") and not force:
+            contagem["duplicado"] += 1
+            continue
+
+        doc_id = doc_id_from_filename(nome_arquivo)
+        entry = catalogo.get(doc_id)
+        decisao = classify_catalog_entry(entry)
+
+        if decisao == "descartar":
+            motivo = (
+                f"descartado pelo catálogo SEI — tipo '{entry['tipo_documento']}'"
+                if entry and entry["status"].strip().lower() == "sucesso"
+                else f"descartado pelo catálogo SEI — status de captura '{entry['status']}'" if entry
+                else "descartado"
+            )
+            db.upsert_arquivo_status(sb, file_hash, nome_arquivo, entry.get("tipo_documento") if entry else None, 1.0, "descartado", motivo)
+            contagem["descartado"] += 1
+            continue
+
+        texto = extract_text(file_bytes)
+        if not texto.strip():
+            db.upsert_arquivo_status(sb, file_hash, nome_arquivo, None, 0.0, "erro", "sem texto extraível (pode precisar de OCR)")
+            contagem["erro"] += 1
+            continue
+
+        tipo_sei = entry["tipo_documento"] if entry else None
+        prompt = pipeline.build_prompt(texto, tipo_sei=tipo_sei)
+
+        custom_id = f"item{i:05d}_{file_hash[:8]}"
+        batch_requests.append(Request(
+            custom_id=custom_id,
+            params=MessageCreateParamsNonStreaming(
+                model=ANTHROPIC_MODEL,
+                max_tokens=8000,
+                messages=[{"role": "user", "content": prompt}],
+            ),
+        ))
+        itens[custom_id] = {
+            "nome_arquivo": nome_arquivo,
+            "hash_arquivo": file_hash,
+            "pasta_processo": pasta_processo,
+            "tipo_sei": tipo_sei,
+            "decisao_catalogo": decisao,
+            # só guardamos o número já resolvido (regex/pasta), não o texto
+            # inteiro do documento — a Batch API pode levar horas para
+            # responder e não faz sentido inchar o banco com isso.
+            "numero_processo_regex": extract_processo_regex(texto),
+            "numero_processo_pasta": pipeline.extract_processo_from_foldername(pasta_processo),
+        }
+        contagem["enviado"] += 1
+
+    return batch_requests, itens, contagem
+
+
+def submit_batch(batch_requests, itens):
+    if not batch_requests:
+        return None
+    batch = _claude_client.messages.batches.create(requests=batch_requests)
+    db.upsert_lote_batch(sb, batch.id, batch.processing_status, len(itens), itens)
+    return batch.id
+
+
+def apply_batch_result(item, result):
+    """Aplica o resultado de UM item de um lote já finalizado (`ended`)."""
+    nome_arquivo = item["nome_arquivo"]
+    file_hash = item["hash_arquivo"]
+    decisao_catalogo = item["decisao_catalogo"]
+    numero_override = item.get("numero_processo_regex") or item.get("numero_processo_pasta")
+
+    if result.result.type != "succeeded":
+        motivo = f"lote: item {result.result.type}"
+        db.upsert_arquivo_status(sb, file_hash, nome_arquivo, item.get("tipo_sei"), 0.0, "erro", motivo)
+        return "erro", motivo
+
+    raw = "".join(b.text for b in result.result.message.content if b.type == "text")
+    try:
+        parsed = json.loads(_clean_json_text(raw))
+    except json.JSONDecodeError as e:
+        motivo = f"lote: resposta da IA não é JSON válido ({e})"
+        db.upsert_arquivo_status(sb, file_hash, nome_arquivo, item.get("tipo_sei"), 0.0, "erro", motivo)
+        return "erro", motivo
+
+    return finalize_result(parsed, file_hash, nome_arquivo, decisao_catalogo, numero_override=numero_override)
+
+
+def process_pending_batches():
+    """Verifica todos os lotes ainda não concluídos e aplica os resultados prontos."""
+    resumo = []
+    for lote in db.fetch_lotes_batch(sb, status_excluir="concluido"):
+        batch = _claude_client.messages.batches.retrieve(lote["id_lote"])
+        if batch.processing_status != "ended":
+            db.upsert_lote_batch(sb, lote["id_lote"], batch.processing_status, lote["total_itens"], lote["itens_json"])
+            resumo.append(f"{lote['id_lote']}: ainda '{batch.processing_status}'")
+            continue
+
+        itens = lote["itens_json"] or {}
+        contagem = {}
+        for result in _claude_client.messages.batches.results(lote["id_lote"]):
+            item = itens.get(result.custom_id)
+            if not item:
+                continue
+            status_label, _ = apply_batch_result(item, result)
+            contagem[status_label] = contagem.get(status_label, 0) + 1
+
+        db.upsert_lote_batch(sb, lote["id_lote"], "concluido", lote["total_itens"], itens)
+        resumo.append(
+            f"{lote['id_lote']}: concluído — {contagem.get('concluido', 0)} ok, "
+            f"{contagem.get('revisao', 0)} revisão, {contagem.get('erro', 0)} erro"
+        )
+    return resumo
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +497,15 @@ if LLM_PROVIDER == "ollama":
         )
         st.stop()
 
+catalogo_csv = st.file_uploader(
+    "Catálogo de tipos de documento do SEI (CSV: nº processo sei, documento, tipo_documento, data_captura, status) — opcional, mas evita gastar tokens com e-mail/recibo/anexo e garante que o Documento de Fiscalização seja sempre reconhecido",
+    type=["csv"],
+)
+catalogo = {}
+if catalogo_csv is not None:
+    catalogo = pipeline.load_catalog(io.StringIO(catalogo_csv.getvalue().decode("utf-8-sig")))
+    st.caption(f"Catálogo carregado: {len(catalogo)} documento(s) mapeado(s).")
+
 uploaded_files = st.file_uploader(
     "Envie PDFs de auditoria, resposta ou parecer — em qualquer ordem, um de cada vez ou em lote",
     type=["pdf"],
@@ -409,13 +522,76 @@ if uploaded_files and st.button(f"Processar {len(uploaded_files)} arquivo(s)", t
     for i, f in enumerate(uploaded_files):
         with st.spinner(f"Processando {f.name}..."):
             try:
-                status, detalhe = process_uploaded_file(f, force=force_reprocess)
+                status, detalhe = process_uploaded_file(f, catalogo=catalogo, force=force_reprocess)
             except Exception as e:
                 status, detalhe = "erro", str(e)
-        icon = {"concluido": "✅", "revisao": "⚠️", "erro": "❌", "duplicado": "↩️"}.get(status, "•")
+        icon = {"concluido": "✅", "revisao": "⚠️", "erro": "❌", "duplicado": "↩️", "descartado": "🗑️"}.get(status, "•")
         st.write(f"{icon} **{f.name}** — {detalhe}")
         progress.progress((i + 1) / len(uploaded_files))
     st.success("Processamento concluído.")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Processamento em lote (ZIP + Batch API) — metade do custo por token,
+# em troca de latência (a Batch API pode levar até 24h para terminar,
+# geralmente menos de 1h). Não afeta o upload direto acima.
+# ---------------------------------------------------------------------------
+st.subheader("Processamento em lote (ZIP)")
+st.caption(
+    "Envie um .zip com uma pasta por processo de auditoria (cada pasta com os PDFs daquele processo). "
+    "Usa a Batch API da Anthropic — metade do custo por token, resultado sai em até 24h (geralmente bem menos)."
+)
+
+if LLM_PROVIDER != "claude":
+    st.info(
+        "Processamento em lote via Batch API só está disponível com LLM_PROVIDER = 'claude' "
+        "(a Batch API é um recurso da Anthropic, sem equivalente no Ollama)."
+    )
+else:
+    zip_file = st.file_uploader("ZIP com as pastas de processo", type=["zip"], key="zip_lote")
+    force_reprocess_lote = st.checkbox(
+        "Forçar reprocessamento no lote (mesmo se já processado antes)",
+        key="force_lote",
+    )
+
+    if zip_file is not None and st.button("Preparar e enviar lote", type="primary"):
+        if not catalogo:
+            st.warning("Envie o catálogo CSV do SEI acima antes de montar o lote — sem ele, nada é descartado/priorizado.")
+        else:
+            with st.spinner("Lendo o ZIP e montando as requisições..."):
+                batch_requests, itens, contagem = prepare_batch_from_zip(zip_file.getvalue(), catalogo, force=force_reprocess_lote)
+            st.write(
+                f"📦 {contagem['enviado']} arquivo(s) para a IA · "
+                f"🗑️ {contagem['descartado']} descartado(s) pelo catálogo · "
+                f"↩️ {contagem['duplicado']} já processado(s) antes · "
+                f"❌ {contagem['erro']} sem texto extraível"
+            )
+            if batch_requests:
+                with st.spinner("Enviando lote para a Batch API..."):
+                    id_lote = submit_batch(batch_requests, itens)
+                st.success(f"Lote enviado: `{id_lote}` — volte aqui mais tarde para verificar o resultado.")
+            else:
+                st.info("Nenhum arquivo precisou da IA neste ZIP — nada foi enviado à Batch API.")
+
+    st.markdown("**Lotes enviados**")
+    lotes = db.fetch_lotes_batch(sb)
+    if lotes:
+        st.dataframe(
+            [{k: v for k, v in l.items() if k != "itens_json"} for l in lotes],
+            use_container_width=True,
+        )
+    else:
+        st.caption("Nenhum lote enviado ainda.")
+
+    if st.button("🔄 Verificar / baixar resultados dos lotes pendentes"):
+        with st.spinner("Consultando a Batch API..."):
+            resumo = process_pending_batches()
+        if resumo:
+            for linha in resumo:
+                st.write(f"• {linha}")
+        else:
+            st.info("Nenhum lote pendente.")
 
 st.divider()
 

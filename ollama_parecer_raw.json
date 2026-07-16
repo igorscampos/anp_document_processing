@@ -1,0 +1,49 @@
+{
+  "tipo_documento": "parecer_anp",
+  "confianca": 0.95,
+  "numero_processo_anp": "48610.229661/2024-49",
+  "numero_relatorio": null,
+  "auditoria": {
+    "codigo_auditoria_anp": "035_SSO_2024",
+    "ordem_servico": "OS SSO_002725",
+    "operadora": "PETROBRAS",
+    "cnpj_operadora": null,
+    "unidade_instalacao": ["P-74", "P-75", "P-76", "P-77"],
+    "tipo_auditoria": "Fiscalização de Segurança Operacional (SGSO)",
+    "sumario_auditoria": "Auditoria nas plataformas P-74 a P-77 verificando conformidade do SGSO. Identificou falhas em instrumentos críticos e tempos de fechamento excessivos, resultando na interdição parcial das válvulas SDV da P-74.",
+    "acao_demandada": "Restaurar funcionalidade dos instrumentos críticos e retornar operação das ESDVs pendentes após testes e anuência ANP.",
+    "data_auditoria_inicio": "2024-11-12",
+    "data_auditoria_fim": "2024-11-14",
+    "data_emissao_relatorio": "2026-06-18",
+    "auditor_responsavel": null,
+    "status_auditoria": "Em andamento (pendências)",
+    "resultado_final": null
+  },
+  "nao_conformidades": [],
+  "respostas": [
+    {
+      "numero_item": "5.1",
+      "resultado_final": "Não atendido",
+      "decisao_anp": "Manutenção da interdição das válvulas SDV-1210001B, D e R até testes aprovados.",
+      "resumo": "Pendências relativas às ESDVs B, D e R não sanadas com evidências de teste."
+    },
+    {
+      "numero_item": "5.2",
+      "resultado_final": "Não atendido",
+      "decisao_anp": "Requerida justificativa técnica para tempos de fechamento > 1,5s.",
+      "resumo": "Operadora não apresentou justificativas técnicas ou estudos complementares aprovados."
+    },
+    {
+      "numero_item": "5.6",
+      "resultado_final": "Não atendido",
+      "decisao_anp": "Pendentes os estudos de gestão de risco para equipamentos críticos fora de operação.",
+      "resumo": "Falta apresentação dos estudos adequados para cenários de grande severidade."
+    },
+    {
+      "numero_item": "5.8",
+      "resultado_final": "Não atendido",
+      "decisao_anp": "Restauração integral não concluída; prazo original ultrapassado.",
+      "resumo": "Um instrumento crítico permanece fora de operação, violando o prazo de 45 dias."
+    }
+  ]
+}
