@@ -282,8 +282,15 @@ def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, nume
     return status_label, msg
 
 
-def process_uploaded_file(uploaded_file, catalogo=None, force=False):
-    file_bytes = uploaded_file.getvalue()
+def process_one_file(file_bytes, nome_arquivo, catalogo=None, force=False, numero_pasta_fallback=None):
+    """Processa 1 arquivo já em memória (bytes) — chamada de IA síncrona.
+
+    Núcleo compartilhado entre o upload direto (um `UploadedFile` do
+    Streamlit) e a fila síncrona do processamento em lote via ZIP (onde os
+    bytes vêm do zipfile, sem objeto de upload). `numero_pasta_fallback` só é
+    usado pelo caminho do ZIP — é o número de processo lido do nome da pasta,
+    para quando o próprio PDF não tem o rodapé padrão do SEI.
+    """
     file_hash = hashlib.sha256(file_bytes).hexdigest()
 
     existing = db.already_processed(sb, file_hash)
@@ -295,7 +302,7 @@ def process_uploaded_file(uploaded_file, catalogo=None, force=False):
     # se já sabemos com certeza que é o Documento de Fiscalização (ou peça
     # oficial equivalente) — nesse caso o tipo final é forçado, não depende
     # da IA acertar a classificação.
-    doc_id = doc_id_from_filename(uploaded_file.name)
+    doc_id = doc_id_from_filename(nome_arquivo)
     entry = (catalogo or {}).get(doc_id)
     decisao_catalogo = classify_catalog_entry(entry)
 
@@ -306,30 +313,44 @@ def process_uploaded_file(uploaded_file, catalogo=None, force=False):
             else f"descartado pelo catálogo SEI — status de captura '{entry['status']}'" if entry
             else "descartado"
         )
-        db.upsert_arquivo_status(sb, file_hash, uploaded_file.name, entry.get("tipo_documento") if entry else None, 1.0, "descartado", motivo)
+        db.upsert_arquivo_status(sb, file_hash, nome_arquivo, entry.get("tipo_documento") if entry else None, 1.0, "descartado", motivo)
         return "descartado", motivo
 
     texto = extract_text(file_bytes)
     if not texto.strip():
-        db.upsert_arquivo_status(sb, file_hash, uploaded_file.name, None, 0.0, "erro", "sem texto extraível (pode precisar de OCR)")
+        db.upsert_arquivo_status(sb, file_hash, nome_arquivo, None, 0.0, "erro", "sem texto extraível (pode precisar de OCR)")
         return "erro", "sem texto extraível (pode precisar de OCR)"
 
     tipo_sei = entry["tipo_documento"] if entry else None
     result = classify_and_extract(texto, tipo_sei=tipo_sei)
-    numero_regex = extract_processo_regex(texto)
+    numero_override = extract_processo_regex(texto) or numero_pasta_fallback
 
-    return finalize_result(result, file_hash, uploaded_file.name, decisao_catalogo, numero_override=numero_regex)
+    return finalize_result(result, file_hash, nome_arquivo, decisao_catalogo, numero_override=numero_override)
+
+
+def process_uploaded_file(uploaded_file, catalogo=None, force=False):
+    return process_one_file(uploaded_file.getvalue(), uploaded_file.name, catalogo=catalogo, force=force)
 
 
 # ---------------------------------------------------------------------------
-# Processamento em lote (ZIP + Batch API) — funcionalidade nova, independente
-# do upload direto acima. Cada pasta de 1º nível dentro do ZIP é 1 processo de
-# auditoria; todos os PDFs "processáveis" (após o filtro do catálogo) do ZIP
-# inteiro viram uma única submissão à Batch API da Anthropic — metade do
-# custo por token do processamento síncrono, em troca de latência maior
-# (a Batch API normalmente termina em menos de 1h, mas pode levar até 24h).
+# Processamento em lote (ZIP) — funcionalidade nova, independente do upload
+# direto acima. Cada pasta de 1º nível dentro do ZIP é 1 processo de
+# auditoria (os arquivos podem estar soltos nessa pasta ou em subpastas
+# dentro dela — tudo que estiver sob a mesma pasta de 1º nível conta pro
+# mesmo processo). Dois caminhos de execução, escolhidos pelo LLM_PROVIDER:
+#   - claude: Batch API da Anthropic — todos os PDFs "processáveis" do ZIP
+#     inteiro viram uma única submissão, metade do custo por token, em troca
+#     de latência maior (normalmente termina em menos de 1h, mas pode levar
+#     até 24h).
+#   - ollama: sem equivalente de Batch API local, então processa em fila
+#     síncrona — chama a IA arquivo por arquivo, aguardando cada resposta
+#     antes de seguir pro próximo, agrupado por processo.
 # ---------------------------------------------------------------------------
 def _iter_zip_pdfs(zip_bytes):
+    """Percorre o ZIP inteiro, inclusive subpastas dentro da pasta de cada
+    processo. O processo é identificado pelo PRIMEIRO segmento do caminho
+    dentro do zip — não importa quantos níveis de subpasta o PDF esteja.
+    """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for info in zf.infolist():
             if info.is_dir():
@@ -340,10 +361,7 @@ def _iter_zip_pdfs(zip_bytes):
             # ignora lixo comum de export de zip (metadados do macOS, ocultos)
             if any(parte.startswith(".") or parte == "__MACOSX" for parte in caminho.parts):
                 continue
-            # usa a pasta MAIS PRÓXIMA do arquivo como "processo" — funciona
-            # tanto para "processo/arquivo.pdf" quanto para o aninhamento
-            # duplicado comum em exports de zip ("processo/processo/arquivo.pdf")
-            pasta_processo = caminho.parent.name or "sem_pasta"
+            pasta_processo = caminho.parts[0] if len(caminho.parts) > 1 else "sem_pasta"
             yield pasta_processo, caminho.name, zf.read(info)
 
 
@@ -413,6 +431,36 @@ def prepare_batch_from_zip(zip_bytes, catalogo, force=False):
         contagem["enviado"] += 1
 
     return batch_requests, itens, contagem
+
+
+def process_zip_batch_sync(zip_bytes, catalogo, force=False, on_item=None):
+    """Processa um ZIP em fila síncrona: chama a IA arquivo por arquivo,
+    aguardando cada resposta antes de seguir pro próximo, agrupado por
+    processo (todos os arquivos de um processo antes de passar ao próximo).
+
+    Único caminho disponível pra Ollama, que não tem Batch API — mas também
+    serve pra rodar um ZIP com Claude sem usar a Batch API, se preferir
+    resultado imediato em vez de esperar o lote.
+
+    "on_item" (opcional) é chamado a cada arquivo processado com
+    (pasta_processo, nome_arquivo, status, detalhe) — usado pra atualizar a
+    UI item a item.
+    """
+    itens = sorted(_iter_zip_pdfs(zip_bytes), key=lambda t: (t[0], t[1]))
+    contagem = {}
+    for pasta_processo, nome_arquivo, file_bytes in itens:
+        numero_pasta = pipeline.extract_processo_from_foldername(pasta_processo)
+        try:
+            status, detalhe = process_one_file(
+                file_bytes, nome_arquivo, catalogo=catalogo, force=force,
+                numero_pasta_fallback=numero_pasta,
+            )
+        except Exception as e:
+            status, detalhe = "erro", str(e)
+        contagem[status] = contagem.get(status, 0) + 1
+        if on_item:
+            on_item(pasta_processo, nome_arquivo, status, detalhe)
+    return contagem
 
 
 def submit_batch(batch_requests, itens):
@@ -539,23 +587,20 @@ st.divider()
 # ---------------------------------------------------------------------------
 st.subheader("Processamento em lote (ZIP)")
 st.caption(
-    "Envie um .zip com uma pasta por processo de auditoria (cada pasta com os PDFs daquele processo). "
-    "Usa a Batch API da Anthropic — metade do custo por token, resultado sai em até 24h (geralmente bem menos)."
+    "Envie um .zip com uma pasta por processo de auditoria — os PDFs daquele processo podem estar "
+    "soltos na pasta ou em subpastas dentro dela."
 )
 
-if LLM_PROVIDER != "claude":
-    st.info(
-        "Processamento em lote via Batch API só está disponível com LLM_PROVIDER = 'claude' "
-        "(a Batch API é um recurso da Anthropic, sem equivalente no Ollama)."
-    )
-else:
-    zip_file = st.file_uploader("ZIP com as pastas de processo", type=["zip"], key="zip_lote")
-    force_reprocess_lote = st.checkbox(
-        "Forçar reprocessamento no lote (mesmo se já processado antes)",
-        key="force_lote",
-    )
+zip_file = st.file_uploader("ZIP com as pastas de processo", type=["zip"], key="zip_lote")
+force_reprocess_lote = st.checkbox(
+    "Forçar reprocessamento no lote (mesmo se já processado antes)",
+    key="force_lote",
+)
 
-    if zip_file is not None and st.button("Preparar e enviar lote", type="primary"):
+if LLM_PROVIDER == "claude":
+    st.caption("Usa a Batch API da Anthropic — metade do custo por token, resultado sai em até 24h (geralmente bem menos).")
+
+    if zip_file is not None and st.button("Preparar e enviar lote (Batch API)", type="primary"):
         if not catalogo:
             st.warning("Envie o catálogo CSV do SEI acima antes de montar o lote — sem ele, nada é descartado/priorizado.")
         else:
@@ -592,6 +637,39 @@ else:
                 st.write(f"• {linha}")
         else:
             st.info("Nenhum lote pendente.")
+
+else:
+    st.caption(
+        "Ollama não tem Batch API — o lote é processado em fila síncrona: chama a IA arquivo por "
+        "arquivo (agrupado por processo), aguardando cada resposta antes de seguir pro próximo."
+    )
+
+    if zip_file is not None and st.button("Processar lote agora (fila síncrona)", type="primary"):
+        if not catalogo:
+            st.warning("Envie o catálogo CSV do SEI acima antes de processar o lote — sem ele, nada é descartado/priorizado.")
+        else:
+            zip_bytes = zip_file.getvalue()
+            total_itens = sum(1 for _ in _iter_zip_pdfs(zip_bytes))
+            if total_itens == 0:
+                st.info("Nenhum PDF encontrado dentro do ZIP.")
+            else:
+                progress = st.progress(0.0)
+                log = st.container()
+                estado = {"i": 0}
+
+                def _on_item(pasta_processo, nome_arquivo, status, detalhe):
+                    estado["i"] += 1
+                    icon = {"concluido": "✅", "revisao": "⚠️", "erro": "❌", "duplicado": "↩️", "descartado": "🗑️"}.get(status, "•")
+                    log.write(f"{icon} **[{pasta_processo}] {nome_arquivo}** — {detalhe}")
+                    progress.progress(estado["i"] / total_itens)
+
+                with st.spinner(f"Processando {total_itens} arquivo(s) na fila..."):
+                    contagem = process_zip_batch_sync(zip_bytes, catalogo, force=force_reprocess_lote, on_item=_on_item)
+                st.success(
+                    f"Lote concluído — {contagem.get('concluido', 0)} ok, {contagem.get('revisao', 0)} revisão, "
+                    f"{contagem.get('erro', 0)} erro, {contagem.get('descartado', 0)} descartado(s), "
+                    f"{contagem.get('duplicado', 0)} já processado(s) antes."
+                )
 
 st.divider()
 
