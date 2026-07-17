@@ -37,7 +37,7 @@ wheels = [
 
 [[package]]
 name = "anthropic"
-version = "0.116.0"
+version = "0.117.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -49,9 +49,9 @@ dependencies = [
     { name = "sniffio" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/66/a2/d31f14e28d49bae983a3634e38dfb4b31c50110b5e403596c5c6a20b23f8/anthropic-0.116.0.tar.gz", hash = "sha256:5fc248fbb9fe03ef686f8a774f81586bca31a043260aab88b387ea3660f4a396", size = 949149, upload-time = "2026-07-02T19:08:10.534Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/41/0d/8f71d535edb0d438f023bd825fb65f67c14fa88a2bd6b75f292a58a63de4/anthropic-0.117.0.tar.gz", hash = "sha256:98107f2b76439641e0ae2a1754087534b8f178dbab99d6eb1bc4b7bc8c744496", size = 989933, upload-time = "2026-07-16T19:36:13.07Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c7/dd/2a1e81cf1b163acc340afc4ec74ed1d86f5eed1a809fabdeed3e0997b346/anthropic-0.116.0-py3-none-any.whl", hash = "sha256:6c0a7698e8d652455da3499978279bb2588c7264d0a35be3666009a4258c8256", size = 956896, upload-time = "2026-07-02T19:08:08.756Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/4c/917d21d6619a4475cdafc6d13a69fdb3b901ddac57e76caca5a25c117b6d/anthropic-0.117.0-py3-none-any.whl", hash = "sha256:451a0a6905f11dff7663d13e4ee5dbf909eb8942b1d049803c7b937a13ac47ec", size = 998327, upload-time = "2026-07-16T19:36:11.225Z" },
 ]
 
 [[package]]
@@ -89,10 +89,9 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", specifier = ">=0.40.0" },
+    { name = "anthropic", specifier = ">=0.117.0" },
     { name = "pdfplumber", specifier = ">=0.11.0" },
-    { name = "streamlit", specifier = ">=1.38.0" },
-    { name = "streamlit", specifier = ">=1.59.0" },
+    { name = "streamlit", specifier = ">=1.59.2" },
     { name = "supabase", specifier = ">=2.9.0" },
 ]
 
@@ -1757,7 +1756,7 @@ wheels = [
 
 [[package]]
 name = "streamlit"
-version = "1.59.0"
+version = "1.59.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "altair" },
@@ -1785,9 +1784,9 @@ dependencies = [
     { name = "watchdog", marker = "sys_platform != 'darwin'" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/90/b8/e13c137c299b47f683fe6d4e198075f37a2c7666c9b96010070d58c2037c/streamlit-1.59.0.tar.gz", hash = "sha256:aaa9616f75421cd7cb8c9de8940b2b7edfe266a9d81e78195252d88fd2b00a75", size = 9760463, upload-time = "2026-07-06T15:28:10.943Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9c/13/725a798311129fc13d7e67dc690f12786c22007b34abe9fd88add9d9b044/streamlit-1.59.2.tar.gz", hash = "sha256:8fcb35df152868d33eec7ad2d89e276499a5351fb861eb1752b76476be7eb582", size = 9770703, upload-time = "2026-07-13T09:00:50.858Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d4/6d/4ea54c377fb208e6a430c40a8dd6b271e5ea8f2191079875731ef88ec3c7/streamlit-1.59.0-py3-none-any.whl", hash = "sha256:d3e3c30caf0915e994b2b263418b28aa05ee5ba90f39e0a59b4c8021dd435d4c", size = 10329987, upload-time = "2026-07-06T15:28:07.753Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/4b/c2902746fb3fcc737ba925865a73475ad51521f26f84652aa9b337e12227/streamlit-1.59.2-py3-none-any.whl", hash = "sha256:5014cb4f0064bd16c58fe334cb0d3c4b7e2be3d1ce4c02202c07114a33576dab", size = 10338011, upload-time = "2026-07-13T09:00:48.464Z" },
 ]
 
 [[package]]
