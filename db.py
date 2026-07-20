@@ -100,7 +100,23 @@ def find_auditoria(sb, numero_processo_anp=None, numero_relatorio=None):
     return None
 
 
+# Colunas de tb_auditorias que a IA pode preencher (exclui id_auditoria,
+# arquivo_origem, criado_em, atualizado_em, que são geridas aqui). "dados"
+# vem de um objeto JSON que a própria IA gerou e é espalhado (**dados) direto
+# no payload — sem esse filtro, qualquer chave inesperada que o modelo
+# inventasse (nome de campo diferente, campo extra) ia direto pro Postgrest e
+# quebrava com "column not found", derrubando o processamento inteiro em vez
+# de só marcar aquele arquivo como erro.
+CAMPOS_AUDITORIA = {
+    "numero_processo_anp", "numero_relatorio", "codigo_auditoria_anp", "ordem_servico",
+    "operadora", "cnpj_operadora", "unidade_instalacao", "tipo_auditoria",
+    "sumario_auditoria", "acao_demandada", "data_auditoria_inicio", "data_auditoria_fim",
+    "data_emissao_relatorio", "auditor_responsavel", "status_auditoria", "resultado_final",
+}
+
+
 def upsert_auditoria(sb, dados, arquivo_origem):
+    dados = {k: v for k, v in dados.items() if k in CAMPOS_AUDITORIA}
     existente = find_auditoria(sb, dados.get("numero_processo_anp"), dados.get("numero_relatorio"))
     if existente:
         id_auditoria = existente["id_auditoria"]

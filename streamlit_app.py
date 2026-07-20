@@ -495,10 +495,21 @@ def apply_batch_result(item, result):
 
 
 def process_pending_batches():
-    """Verifica todos os lotes ainda não concluídos e aplica os resultados prontos."""
+    """Verifica todos os lotes ainda não concluídos e aplica os resultados prontos.
+
+    Cada item e cada lote são isolados em try/except — um resultado com
+    problema (ex: JSON com campo que a IA inventou e não existe na tabela)
+    vira só um "erro" registrado naquele arquivo, igual ao upload direto, em
+    vez de derrubar a verificação inteira e quebrar a página no Streamlit.
+    """
     resumo = []
     for lote in db.fetch_lotes_batch(sb, status_excluir="concluido"):
-        batch = _claude_client.messages.batches.retrieve(lote["id_lote"])
+        try:
+            batch = _claude_client.messages.batches.retrieve(lote["id_lote"])
+        except Exception as e:
+            resumo.append(f"{lote['id_lote']}: erro ao consultar o lote — {e}")
+            continue
+
         if batch.processing_status != "ended":
             db.upsert_lote_batch(sb, lote["id_lote"], batch.processing_status, lote["total_itens"], lote["itens_json"])
             resumo.append(f"{lote['id_lote']}: ainda '{batch.processing_status}'")
@@ -510,7 +521,11 @@ def process_pending_batches():
             item = itens.get(result.custom_id)
             if not item:
                 continue
-            status_label, _ = apply_batch_result(item, result)
+            try:
+                status_label, _ = apply_batch_result(item, result)
+            except Exception as e:
+                db.upsert_arquivo_status(sb, item["hash_arquivo"], item["nome_arquivo"], item.get("tipo_sei"), 0.0, "erro", f"lote: falha ao aplicar resultado — {e}")
+                status_label = "erro"
             contagem[status_label] = contagem.get(status_label, 0) + 1
 
         db.upsert_lote_batch(sb, lote["id_lote"], "concluido", lote["total_itens"], itens)
