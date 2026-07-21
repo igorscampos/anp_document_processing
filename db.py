@@ -7,6 +7,7 @@ resultado já extraído pela IA fica guardado em tb_arquivos_processados
 gravada — sem precisar chamar a API de novo.
 """
 
+import re
 import uuid
 
 from supabase import create_client
@@ -41,7 +42,8 @@ def already_processed(sb, file_hash):
     return res.data[0] if res.data else None
 
 
-def upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo_documento, confianca, status, motivo=None, payload_json=None):
+def upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo_documento, confianca, status, motivo=None, payload_json=None,
+                           numero_sei=None, numero_processo_anp=None, numero_processo_divergente=None, link_arquivo=None):
     sb.table("tb_arquivos_processados").upsert({
         "hash_arquivo": file_hash,
         "nome_arquivo": nome_arquivo,
@@ -50,7 +52,29 @@ def upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo_documento, confianca
         "status": status,
         "motivo": motivo,
         "payload_json": payload_json,
+        "numero_sei": numero_sei,
+        "numero_processo_anp": numero_processo_anp,
+        "numero_processo_divergente": numero_processo_divergente,
+        "link_arquivo": link_arquivo,
     }).execute()
+
+
+def fetch_link_arquivo(sb, numero_sei):
+    """Link do Storage de um arquivo já processado, buscado pelo número SEI
+    (nome do arquivo sem extensão) — usado pra resolver o link de uma
+    evidência pro arquivo que realmente tem o detalhe, não pro documento
+    principal que só cita esse número."""
+    if not numero_sei:
+        return None
+    res = (
+        sb.table("tb_arquivos_processados")
+        .select("link_arquivo")
+        .eq("numero_sei", numero_sei)
+        .not_.is_("link_arquivo", "null")
+        .limit(1)
+        .execute()
+    )
+    return res.data[0]["link_arquivo"] if res.data else None
 
 
 def fetch_pendentes(sb):
@@ -111,7 +135,8 @@ CAMPOS_AUDITORIA = {
     "numero_processo_anp", "numero_relatorio", "codigo_auditoria_anp", "ordem_servico",
     "operadora", "cnpj_operadora", "unidade_instalacao", "tipo_auditoria",
     "sumario_auditoria", "acao_demandada", "data_auditoria_inicio", "data_auditoria_fim",
-    "data_emissao_relatorio", "auditor_responsavel", "status_auditoria", "resultado_final",
+    "data_emissao_relatorio", "auditor_responsavel", "auditores_equipe", "status_auditoria",
+    "resultado_final",
 }
 
 
@@ -130,6 +155,21 @@ def upsert_auditoria(sb, dados, arquivo_origem):
     return id_auditoria
 
 
+def atualizar_arquivo_origem_df(sb, id_auditoria, arquivo_origem, score):
+    """Só troca arquivo_origem (+ arquivo_origem_score) da auditoria se o novo
+    score for MAIOR que o já salvo — garante que, quando há mais de um DF no
+    mesmo processo, o mais informativo (mais não conformidades e mais campos
+    de auditoria preenchidos) fique como referência, não importa a ordem de
+    chegada dos arquivos."""
+    res = sb.table("tb_auditorias").select("arquivo_origem_score").eq("id_auditoria", id_auditoria).execute()
+    atual = (res.data[0].get("arquivo_origem_score") if res.data else 0) or 0
+    if score > atual:
+        sb.table("tb_auditorias").update({
+            "arquivo_origem": arquivo_origem,
+            "arquivo_origem_score": score,
+        }).eq("id_auditoria", id_auditoria).execute()
+
+
 # ---------------------------------------------------------------------------
 # tb_nao_conformidades
 # ---------------------------------------------------------------------------
@@ -142,7 +182,15 @@ def find_nc(sb, id_auditoria, numero_item):
     return None
 
 
-def upsert_nc(sb, id_auditoria, nc, arquivo_origem):
+def fetch_ncs_resumo(sb, id_auditoria):
+    """numero_item + descricao de cada NC da auditoria — usado pra dar
+    contexto à IA (no prompt principal ou no re-casamento) sem precisar
+    buscar a linha inteira."""
+    res = sb.table("tb_nao_conformidades").select("numero_item,descricao").eq("id_auditoria", id_auditoria).execute()
+    return [row for row in res.data if row.get("numero_item")]
+
+
+def upsert_nc(sb, id_auditoria, nc, arquivo_origem, link_arquivo=None):
     existente = find_nc(sb, id_auditoria, nc.get("numero_item"))
     if existente:
         sb.table("tb_nao_conformidades").update({
@@ -170,14 +218,14 @@ def upsert_nc(sb, id_auditoria, nc, arquivo_origem):
             "arquivo_origem": arquivo_origem,
         }).execute()
 
-    insert_evidencias(sb, nc.get("evidencias"), arquivo_origem, id_nao_conformidade=id_nc)
+    insert_evidencias(sb, nc.get("evidencias"), arquivo_origem, id_nao_conformidade=id_nc, link_arquivo=link_arquivo)
     return id_nc
 
 
 # ---------------------------------------------------------------------------
 # tb_respostas
 # ---------------------------------------------------------------------------
-def insert_resposta(sb, id_nc, id_auditoria, tipo_registro, r, arquivo_origem):
+def insert_resposta(sb, id_nc, id_auditoria, tipo_registro, r, arquivo_origem, link_arquivo=None):
     id_resposta = gen_id("RESP")
     sb.table("tb_respostas").insert({
         "id_resposta": id_resposta,
@@ -187,9 +235,14 @@ def insert_resposta(sb, id_nc, id_auditoria, tipo_registro, r, arquivo_origem):
         "resultado_final": r.get("resultado_final"),
         "decisao_anp": r.get("decisao_anp"),
         "texto_resposta": r.get("resumo"),
+        "data_resposta": r.get("data_resposta"),
         "arquivo_origem": arquivo_origem,
     }).execute()
-    insert_evidencias(sb, r.get("evidencias"), arquivo_origem, id_resposta=id_resposta)
+    # Evidência só é registrada pra resposta da OPERADORA — parecer da ANP não
+    # gera linha em tb_evidencias (evidência é sempre algo apresentado pela
+    # operadora em resposta, ou o próprio achado do DF).
+    if tipo_registro == "resposta_operadora":
+        insert_evidencias(sb, r.get("evidencias"), arquivo_origem, id_resposta=id_resposta, link_arquivo=link_arquivo)
     if r.get("resultado_final"):
         sb.table("tb_nao_conformidades").update(
             {"status_atual": r.get("resultado_final")}
@@ -203,13 +256,26 @@ def insert_resposta(sb, id_nc, id_auditoria, tipo_registro, r, arquivo_origem):
 # ---------------------------------------------------------------------------
 APRESENTADO_POR_VALIDOS = {"anp", "operadora"}
 
+# Acha o número SEI citado dentro da própria descrição da evidência — o texto
+# já vem nesse formato na maioria dos casos ("Carta DPBR-2024-11589
+# (4529951)", "Parecer nº 197 (4837346)", "(SEI nº 5093911)"). Em vez de
+# depender da IA emitir um campo JSON separado pra isso, extrai por regex:
+# mais simples e funciona mesmo em evidências já extraídas antes dessa
+# mudança. 6-8 dígitos evita casar ano ("2019"), percentual etc.
+REGEX_SEI_REFERENCIADO = re.compile(r"\((?:sei\s*n?º?\s*)?(\d{6,8})\)", re.IGNORECASE)
+
+
+def _extrai_arquivo_referenciado(descricao):
+    m = REGEX_SEI_REFERENCIADO.search(descricao or "")
+    return m.group(1) if m else None
+
 
 def _normaliza_apresentado_por(valor):
     valor = (valor or "").strip().lower()
     return valor if valor in APRESENTADO_POR_VALIDOS else None
 
 
-def insert_evidencias(sb, evidencias, arquivo_origem, id_nao_conformidade=None, id_resposta=None):
+def insert_evidencias(sb, evidencias, arquivo_origem, id_nao_conformidade=None, id_resposta=None, link_arquivo=None):
     """Grava as evidências de UMA não conformidade OU UMA resposta (nunca as
     duas — respeita a mesma regra da constraint em tb_evidencias).
 
@@ -217,6 +283,13 @@ def insert_evidencias(sb, evidencias, arquivo_origem, id_nao_conformidade=None, 
     imperfeitos (string solta em vez de objeto, valor de apresentado_por fora
     do esperado) sem quebrar, e evita duplicar a mesma evidência se o mesmo
     item for reprocessado ou citado de novo por outro documento.
+
+    Pra cada evidência, tenta achar (via regex, ver `_extrai_arquivo_referenciado`)
+    um número SEI citado na própria descrição — se achar E já existir o link
+    daquele arquivo em `tb_arquivos_processados` (`fetch_link_arquivo`), o
+    link da evidência aponta pro arquivo QUE TEM o detalhe, não pro
+    documento atual (`link_arquivo`, usado só como fallback quando não há
+    nada mais específico pra apontar).
     """
     if not evidencias:
         return
@@ -240,15 +313,99 @@ def insert_evidencias(sb, evidencias, arquivo_origem, id_nao_conformidade=None, 
         descricao = (ev.get("descricao") or "").strip()
         if not descricao or _norm(descricao) in ja_registradas:
             continue
+
+        arquivo_referenciado = _extrai_arquivo_referenciado(descricao)
+        link_evidencia = link_arquivo
+        if arquivo_referenciado:
+            link_referenciado = fetch_link_arquivo(sb, arquivo_referenciado)
+            if link_referenciado:
+                link_evidencia = link_referenciado
+
         sb.table("tb_evidencias").insert({
             "id_evidencia": gen_id("EVID"),
             "id_nao_conformidade": id_nao_conformidade,
             "id_resposta": id_resposta,
             "apresentado_por": _normaliza_apresentado_por(ev.get("apresentado_por")),
             "descricao": descricao,
+            "arquivo_referenciado": arquivo_referenciado,
+            "link_evidencia": link_evidencia,
             "arquivo_origem": arquivo_origem,
         }).execute()
         ja_registradas.add(_norm(descricao))
+
+
+def fetch_evidencias_por_anexo(sb, numero_sei):
+    """Não conformidades que citaram este número SEI como fonte de mais
+    detalhe (via `arquivo_referenciado`) — usado pra decidir, ANTES de
+    descartar um arquivo tipo "Anexo", se vale a pena lê-lo."""
+    if not numero_sei:
+        return []
+    res = (
+        sb.table("tb_evidencias")
+        .select("id_nao_conformidade,descricao")
+        .eq("arquivo_referenciado", numero_sei)
+        .not_.is_("id_nao_conformidade", "null")
+        .execute()
+    )
+    return res.data
+
+
+# ---------------------------------------------------------------------------
+# Supabase Storage — evidências são salvas como o PDF de origem inteiro,
+# disponibilizado por link público (não um recorte de página).
+# ---------------------------------------------------------------------------
+BUCKET_EVIDENCIAS = "evidencias"
+
+
+def ensure_bucket(sb, nome=BUCKET_EVIDENCIAS):
+    """Cria o bucket de evidências no Storage se ainda não existir.
+
+    Idempotente — a API de storage não tem "create if not exists", então só
+    ignora o erro de bucket já existente (qualquer outra falha real aparece
+    de novo no upload logo em seguida, sem ficar mascarada aqui).
+    """
+    try:
+        sb.storage.create_bucket(nome, options={"public": True})
+    except Exception as e:
+        if "already exists" not in str(e).lower() and "duplicate" not in str(e).lower():
+            raise
+
+
+def upload_evidencia_arquivo(sb, file_bytes, file_hash, nome_arquivo, bucket=BUCKET_EVIDENCIAS):
+    """Sobe o PDF de origem pro Storage e devolve a URL pública.
+
+    Usa o hash do arquivo como nome do objeto — o mesmo PDF nunca sobe duas
+    vezes (reprocessamento, ou o mesmo arquivo citado por vários itens só
+    reaproveita o link já existente via upsert).
+    """
+    ensure_bucket(sb, bucket)
+    extensao = nome_arquivo.rsplit(".", 1)[-1] if "." in nome_arquivo else "pdf"
+    caminho = f"{file_hash}.{extensao}"
+    sb.storage.from_(bucket).upload(
+        caminho, file_bytes,
+        file_options={"content-type": "application/pdf", "upsert": "true"},
+    )
+    return sb.storage.from_(bucket).get_public_url(caminho)
+
+
+# ---------------------------------------------------------------------------
+# tb_processos_reprocessar — marca um processo inteiro para forçar releitura
+# e reescrita mesmo sem o checkbox global de "forçar reprocessamento".
+# ---------------------------------------------------------------------------
+def marcar_processos_reprocessar(sb, numeros_processo_anp):
+    for numero in numeros_processo_anp:
+        numero = _norm_processo(numero)
+        if numero:
+            sb.table("tb_processos_reprocessar").upsert({"numero_processo_anp": numero}).execute()
+
+
+def fetch_processos_reprocessar(sb):
+    res = sb.table("tb_processos_reprocessar").select("*").execute()
+    return {_norm_processo(row["numero_processo_anp"]) for row in res.data}
+
+
+def desmarcar_processo_reprocessar(sb, numero_processo_anp):
+    sb.table("tb_processos_reprocessar").delete().eq("numero_processo_anp", _norm_processo(numero_processo_anp)).execute()
 
 
 # ---------------------------------------------------------------------------

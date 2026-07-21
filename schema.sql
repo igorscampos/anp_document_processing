@@ -17,9 +17,11 @@ create table if not exists tb_auditorias (
     data_auditoria_fim text,
     data_emissao_relatorio text,
     auditor_responsavel text,
+    auditores_equipe text,  -- demais integrantes da equipe (além do líder), concatenados com "; "
     status_auditoria text,
     resultado_final text,
     arquivo_origem text,
+    arquivo_origem_score integer default 0,  -- "riqueza" do arquivo_origem atual (qtd de NCs + campos preenchidos) — só troca de DF de referência quando um novo tiver score maior
     criado_em timestamptz default now(),
     atualizado_em timestamptz default now()
 );
@@ -67,11 +69,22 @@ create table if not exists tb_evidencias (
     id_resposta text references tb_respostas(id_resposta),
     apresentado_por text check (apresentado_por in ('anp', 'operadora')),
     descricao text,
+    arquivo_referenciado text,  -- nº SEI citado dentro da própria descricao (regex), se houver
+    link_evidencia text,  -- URL pública do PDF de origem no Supabase Storage — do arquivo_referenciado quando já processado, senão do arquivo_origem
     arquivo_origem text,
     criado_em timestamptz default now(),
     constraint tb_evidencias_um_pai_so check (
         (id_nao_conformidade is not null)::int + (id_resposta is not null)::int = 1
     )
+);
+
+-- Controla quais processos foram marcados pra forçar releitura e reescrita
+-- (independente do checkbox global de "forçar reprocessamento" no upload).
+-- Cada linha é removida automaticamente depois que o(s) arquivo(s) daquele
+-- processo forem reprocessados (marca de "um disparo só").
+create table if not exists tb_processos_reprocessar (
+    numero_processo_anp text primary key,
+    criado_em timestamptz default now()
 );
 
 -- Controla arquivos já processados (evita gastar tokens de novo com o mesmo PDF)
@@ -85,6 +98,10 @@ create table if not exists tb_arquivos_processados (
     status text,
     motivo text,
     payload_json jsonb,       -- guarda o resultado já extraído da IA para reprocessar sem gastar tokens de novo
+    numero_sei text,                    -- número do documento no SEI (coluna "documento" do catálogo CSV)
+    numero_processo_anp text,           -- número de processo vindo do catálogo CSV (fonte de verdade, não regex/IA)
+    numero_processo_divergente text,    -- número diferente encontrado no texto/pasta, se houver, só para auditoria
+    link_arquivo text,                  -- URL pública do Storage deste arquivo — permite achar o link de um documento pelo numero_sei depois
     criado_em timestamptz default now(),
     atualizado_em timestamptz default now()
 );
@@ -109,6 +126,7 @@ alter table tb_respostas disable row level security;
 alter table tb_evidencias disable row level security;
 alter table tb_arquivos_processados disable row level security;
 alter table tb_lotes_batch disable row level security;
+alter table tb_processos_reprocessar disable row level security;
 
 -- ---------------------------------------------------------------------
 -- ALTER: rode isto se você já tinha a versão anterior do schema aplicada
@@ -122,18 +140,24 @@ alter table tb_lotes_batch disable row level security;
 -- alter table tb_auditorias add column if not exists resultado_final text;
 -- alter table tb_nao_conformidades add column if not exists categoria_nao_conformidade text;
 -- alter table tb_nao_conformidades add column if not exists acao_recomendada text;
+-- alter table tb_auditorias add column if not exists auditores_equipe text;
+-- alter table tb_arquivos_processados add column if not exists numero_sei text;
+-- alter table tb_arquivos_processados add column if not exists numero_processo_anp text;
+-- alter table tb_arquivos_processados add column if not exists numero_processo_divergente text;
 -- create table if not exists tb_evidencias (
 --     id_evidencia text primary key,
 --     id_nao_conformidade text references tb_nao_conformidades(id_nao_conformidade),
 --     id_resposta text references tb_respostas(id_resposta),
 --     apresentado_por text check (apresentado_por in ('anp', 'operadora')),
 --     descricao text,
+--     link_evidencia text,
 --     arquivo_origem text,
 --     criado_em timestamptz default now(),
 --     constraint tb_evidencias_um_pai_so check (
 --         (id_nao_conformidade is not null)::int + (id_resposta is not null)::int = 1
 --     )
 -- );
+-- alter table tb_evidencias add column if not exists link_evidencia text;
 -- alter table tb_evidencias disable row level security;
 -- create table if not exists tb_lotes_batch (
 --     id_lote text primary key,
@@ -144,3 +168,11 @@ alter table tb_lotes_batch disable row level security;
 --     atualizado_em timestamptz default now()
 -- );
 -- alter table tb_lotes_batch disable row level security;
+-- create table if not exists tb_processos_reprocessar (
+--     numero_processo_anp text primary key,
+--     criado_em timestamptz default now()
+-- );
+-- alter table tb_processos_reprocessar disable row level security;
+-- alter table tb_auditorias add column if not exists arquivo_origem_score integer default 0;
+-- alter table tb_evidencias add column if not exists arquivo_referenciado text;
+-- alter table tb_arquivos_processados add column if not exists link_arquivo text;
