@@ -153,21 +153,24 @@ def upsert_nc(sb, id_auditoria, nc, arquivo_origem):
             "acao_recomendada": nc.get("acao_recomendada") or existente.get("acao_recomendada"),
             "prazo_correcao": nc.get("prazo_correcao") or existente.get("prazo_correcao"),
         }).eq("id_nao_conformidade", existente["id_nao_conformidade"]).execute()
-        return existente["id_nao_conformidade"]
-    id_nc = gen_id("NC")
-    sb.table("tb_nao_conformidades").insert({
-        "id_nao_conformidade": id_nc,
-        "id_auditoria": id_auditoria,
-        "numero_item": nc.get("numero_item"),
-        "descricao": nc.get("descricao"),
-        "categoria_nao_conformidade": nc.get("categoria_nao_conformidade"),
-        "norma_referencia": nc.get("norma_referencia"),
-        "classificacao_gravidade": nc.get("classificacao_gravidade"),
-        "acao_recomendada": nc.get("acao_recomendada"),
-        "prazo_correcao": nc.get("prazo_correcao"),
-        "status_atual": "pendente de resposta",
-        "arquivo_origem": arquivo_origem,
-    }).execute()
+        id_nc = existente["id_nao_conformidade"]
+    else:
+        id_nc = gen_id("NC")
+        sb.table("tb_nao_conformidades").insert({
+            "id_nao_conformidade": id_nc,
+            "id_auditoria": id_auditoria,
+            "numero_item": nc.get("numero_item"),
+            "descricao": nc.get("descricao"),
+            "categoria_nao_conformidade": nc.get("categoria_nao_conformidade"),
+            "norma_referencia": nc.get("norma_referencia"),
+            "classificacao_gravidade": nc.get("classificacao_gravidade"),
+            "acao_recomendada": nc.get("acao_recomendada"),
+            "prazo_correcao": nc.get("prazo_correcao"),
+            "status_atual": "pendente de resposta",
+            "arquivo_origem": arquivo_origem,
+        }).execute()
+
+    insert_evidencias(sb, nc.get("evidencias"), arquivo_origem, id_nao_conformidade=id_nc)
     return id_nc
 
 
@@ -175,8 +178,9 @@ def upsert_nc(sb, id_auditoria, nc, arquivo_origem):
 # tb_respostas
 # ---------------------------------------------------------------------------
 def insert_resposta(sb, id_nc, id_auditoria, tipo_registro, r, arquivo_origem):
+    id_resposta = gen_id("RESP")
     sb.table("tb_respostas").insert({
-        "id_resposta": gen_id("RESP"),
+        "id_resposta": id_resposta,
         "id_nao_conformidade": id_nc,
         "id_auditoria": id_auditoria,
         "tipo_registro": tipo_registro,
@@ -185,10 +189,66 @@ def insert_resposta(sb, id_nc, id_auditoria, tipo_registro, r, arquivo_origem):
         "texto_resposta": r.get("resumo"),
         "arquivo_origem": arquivo_origem,
     }).execute()
+    insert_evidencias(sb, r.get("evidencias"), arquivo_origem, id_resposta=id_resposta)
     if r.get("resultado_final"):
         sb.table("tb_nao_conformidades").update(
             {"status_atual": r.get("resultado_final")}
         ).eq("id_nao_conformidade", id_nc).execute()
+
+
+# ---------------------------------------------------------------------------
+# tb_evidencias — 1 linha por evidência, ligada a uma não conformidade OU a
+# uma resposta (nunca as duas), com origem (ANP ou operadora). Uma NC ou
+# resposta pode ter várias evidências, por isso é lista, não campo único.
+# ---------------------------------------------------------------------------
+APRESENTADO_POR_VALIDOS = {"anp", "operadora"}
+
+
+def _normaliza_apresentado_por(valor):
+    valor = (valor or "").strip().lower()
+    return valor if valor in APRESENTADO_POR_VALIDOS else None
+
+
+def insert_evidencias(sb, evidencias, arquivo_origem, id_nao_conformidade=None, id_resposta=None):
+    """Grava as evidências de UMA não conformidade OU UMA resposta (nunca as
+    duas — respeita a mesma regra da constraint em tb_evidencias).
+
+    "evidencias" é o array bruto que a IA devolveu — trata formatos
+    imperfeitos (string solta em vez de objeto, valor de apresentado_por fora
+    do esperado) sem quebrar, e evita duplicar a mesma evidência se o mesmo
+    item for reprocessado ou citado de novo por outro documento.
+    """
+    if not evidencias:
+        return
+    if isinstance(evidencias, dict):
+        evidencias = [evidencias]
+    if not isinstance(evidencias, list):
+        return
+
+    query = sb.table("tb_evidencias").select("descricao")
+    if id_nao_conformidade:
+        query = query.eq("id_nao_conformidade", id_nao_conformidade)
+    else:
+        query = query.eq("id_resposta", id_resposta)
+    ja_registradas = {_norm(row.get("descricao")) for row in query.execute().data}
+
+    for ev in evidencias:
+        if isinstance(ev, str):
+            ev = {"descricao": ev, "apresentado_por": None}
+        if not isinstance(ev, dict):
+            continue
+        descricao = (ev.get("descricao") or "").strip()
+        if not descricao or _norm(descricao) in ja_registradas:
+            continue
+        sb.table("tb_evidencias").insert({
+            "id_evidencia": gen_id("EVID"),
+            "id_nao_conformidade": id_nao_conformidade,
+            "id_resposta": id_resposta,
+            "apresentado_por": _normaliza_apresentado_por(ev.get("apresentado_por")),
+            "descricao": descricao,
+            "arquivo_origem": arquivo_origem,
+        }).execute()
+        ja_registradas.add(_norm(descricao))
 
 
 # ---------------------------------------------------------------------------

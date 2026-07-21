@@ -48,12 +48,30 @@ create table if not exists tb_respostas (
     data_resposta text,
     texto_resposta text,
     acao_corretiva text,
-    evidencias_anexadas text,
+    evidencias_anexadas text,  -- superseded por tb_evidencias (1 evidência por linha, com origem); mantida só por compatibilidade, o app não escreve mais aqui
     decisao_anp text,
     justificativa_decisao text,
     resultado_final text,
     arquivo_origem text,
     criado_em timestamptz default now()
+);
+
+-- Uma não conformidade ou uma resposta pode ter VÁRIAS evidências, cada uma
+-- apresentada pela ANP ou pela operadora — por isso é tabela própria (1 linha
+-- por evidência) em vez de um campo de texto único nas tabelas pai. Cada
+-- linha se liga a EXATAMENTE UMA das duas (id_nao_conformidade OU
+-- id_resposta, nunca as duas ao mesmo tempo nem nenhuma das duas).
+create table if not exists tb_evidencias (
+    id_evidencia text primary key,
+    id_nao_conformidade text references tb_nao_conformidades(id_nao_conformidade),
+    id_resposta text references tb_respostas(id_resposta),
+    apresentado_por text check (apresentado_por in ('anp', 'operadora')),
+    descricao text,
+    arquivo_origem text,
+    criado_em timestamptz default now(),
+    constraint tb_evidencias_um_pai_so check (
+        (id_nao_conformidade is not null)::int + (id_resposta is not null)::int = 1
+    )
 );
 
 -- Controla arquivos já processados (evita gastar tokens de novo com o mesmo PDF)
@@ -88,6 +106,7 @@ create table if not exists tb_lotes_batch (
 alter table tb_auditorias disable row level security;
 alter table tb_nao_conformidades disable row level security;
 alter table tb_respostas disable row level security;
+alter table tb_evidencias disable row level security;
 alter table tb_arquivos_processados disable row level security;
 alter table tb_lotes_batch disable row level security;
 
@@ -103,6 +122,19 @@ alter table tb_lotes_batch disable row level security;
 -- alter table tb_auditorias add column if not exists resultado_final text;
 -- alter table tb_nao_conformidades add column if not exists categoria_nao_conformidade text;
 -- alter table tb_nao_conformidades add column if not exists acao_recomendada text;
+-- create table if not exists tb_evidencias (
+--     id_evidencia text primary key,
+--     id_nao_conformidade text references tb_nao_conformidades(id_nao_conformidade),
+--     id_resposta text references tb_respostas(id_resposta),
+--     apresentado_por text check (apresentado_por in ('anp', 'operadora')),
+--     descricao text,
+--     arquivo_origem text,
+--     criado_em timestamptz default now(),
+--     constraint tb_evidencias_um_pai_so check (
+--         (id_nao_conformidade is not null)::int + (id_resposta is not null)::int = 1
+--     )
+-- );
+-- alter table tb_evidencias disable row level security;
 -- create table if not exists tb_lotes_batch (
 --     id_lote text primary key,
 --     status text,

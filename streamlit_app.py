@@ -699,7 +699,7 @@ with col2:
         else:
             st.info("Nada foi resolvido — ainda faltam documentos correspondentes.")
 
-tab1, tab2, tab3, tab4 = st.tabs(["tb_auditorias", "tb_nao_conformidades", "tb_respostas", "fila pendente / revisão"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["tb_auditorias", "tb_nao_conformidades", "tb_respostas", "tb_evidencias", "fila pendente / revisão"])
 
 with tab1:
     st.dataframe(db.fetch_all(sb, "tb_auditorias"), use_container_width=True)
@@ -711,6 +711,13 @@ with tab3:
     st.dataframe(db.fetch_all(sb, "tb_respostas"), use_container_width=True)
 
 with tab4:
+    st.dataframe(db.fetch_all(sb, "tb_evidencias"), use_container_width=True)
+    st.caption(
+        "Cada linha é 1 evidência ligada a UMA não conformidade ou UMA resposta (nunca as duas) — "
+        "'apresentado_por' indica se foi a operadora ou a própria ANP quem apresentou."
+    )
+
+with tab5:
     pendentes = [
         a for a in db.fetch_all(sb, "tb_arquivos_processados")
         if a["status"] in ("pendente_vinculo", "parcial", "revisao_manual", "erro")

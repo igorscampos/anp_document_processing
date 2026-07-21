@@ -235,8 +235,8 @@ Preencha "auditoria" (objeto com codigo_auditoria_anp, ordem_servico, operadora,
 unidade_instalacao, tipo_auditoria, sumario_auditoria, acao_demandada, data_auditoria_inicio,
 data_auditoria_fim, data_emissao_relatorio, auditor_responsavel, status_auditoria, resultado_final)
 e "nao_conformidades" (array de {{numero_item, descricao, categoria_nao_conformidade,
-norma_referencia, classificacao_gravidade, acao_recomendada, prazo_correcao}}) SOMENTE se
-tipo_documento for auditoria_oficial. O anexo técnico de uma auditoria também conta como
+norma_referencia, classificacao_gravidade, acao_recomendada, prazo_correcao, evidencias}}) SOMENTE
+se tipo_documento for auditoria_oficial. O anexo técnico de uma auditoria também conta como
 auditoria_oficial.
 
 Detalhe de cada campo novo de "auditoria":
@@ -256,6 +256,8 @@ Detalhe de cada campo novo de "nao_conformidades":
 - acao_recomendada: a ação que a ANP exige da operadora para sanar especificamente este item,
   em até 20 palavras (geralmente o próprio texto da notificação, ex: "Refazer o estudo de
   dispersão de gases considerando condição de calmaria").
+- evidencias: ver seção "EVIDÊNCIAS" abaixo — evidências que fundamentam ESTA não conformidade
+  específica (ex: registro fotográfico, laudo técnico, relatório citado como base do achado).
 
 ATENÇÃO — numeração dos itens em Documentos de Fiscalização da ANP: é comum o documento ter DUAS
 listas sobre os mesmos assuntos, com numerações diferentes:
@@ -269,10 +271,24 @@ de notificação formal (ex: "5.4"), mesmo que você use o texto da seção desc
 "descricao" com mais detalhe. Nunca use a numeração da seção descritiva (ex: "3.1") como numero_item
 se existir uma seção de notificação formal correspondente no mesmo documento.
 
-Preencha "respostas" (array de {{numero_item, resultado_final, decisao_anp, resumo}}) SOMENTE se
-tipo_documento for resposta_operadora ou parecer_anp. numero_item deve corresponder exatamente ao
-número usado pelo próprio documento ao citar a não conformidade/condicionante (ex: "5.4"). resumo
-em até 25 palavras.
+Preencha "respostas" (array de {{numero_item, resultado_final, decisao_anp, resumo, evidencias}})
+SOMENTE se tipo_documento for resposta_operadora ou parecer_anp. numero_item deve corresponder
+exatamente ao número usado pelo próprio documento ao citar a não conformidade/condicionante
+(ex: "5.4"). resumo em até 25 palavras.
+
+EVIDÊNCIAS — tanto em "nao_conformidades" quanto em "respostas", "evidencias" é um array de
+{{descricao, apresentado_por}} com TODOS os documentos que o texto cita como prova/evidência
+específica DAQUELE item (pode haver mais de uma evidência pro mesmo item; use array vazio [] se
+o texto não citar nenhuma para esse item — nunca invente uma evidência que não esteja no texto):
+- descricao: a referência ao documento citado como evidência, geralmente uma Carta, Anexo, Ofício
+  ou laudo/relatório técnico junto do número SEI entre parênteses quando houver (ex: "Carta
+  DPBR-2024-11589 (4529951)", "Anexo 03- Solicitacoes_P-76 (4529954)", "registro fotográfico anexo").
+- apresentado_por: "operadora" se a evidência foi submetida pela empresa fiscalizada (ex: Cartas
+  da operadora, anexos técnicos enviados por ela em resposta a uma notificação); "anp" se foi a
+  própria ANP quem produziu/anexou a evidência (ex: registro da fiscalização, laudo do auditor,
+  parecer técnico anterior). Use null só se o texto não deixar claro quem apresentou.
+- Cuidado para não misturar evidências de itens diferentes: associe cada evidência apenas ao
+  numero_item que o próprio texto vincula a ela, não à lista inteira de referências do documento.
 
 Responda APENAS o JSON, começando com {{ e terminando com }}, sem nenhum texto antes ou depois.
 
