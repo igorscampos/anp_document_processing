@@ -116,6 +116,7 @@ create table if not exists tb_lotes_batch (
     status text,                     -- 'in_progress' | 'canceling' | 'ended' | 'concluido'
     total_itens integer,
     itens_json jsonb,                -- custom_id -> {nome_arquivo, hash_arquivo, pasta_processo, tipo_sei, decisao_catalogo, numero_processo_regex, numero_processo_pasta}
+    nome_arquivo_zip text,           -- nome do .zip de origem — cada zip enviado vira um lote independente
     criado_em timestamptz default now(),
     atualizado_em timestamptz default now()
 );
@@ -176,3 +177,4 @@ alter table tb_processos_reprocessar disable row level security;
 -- alter table tb_auditorias add column if not exists arquivo_origem_score integer default 0;
 -- alter table tb_evidencias add column if not exists arquivo_referenciado text;
 -- alter table tb_arquivos_processados add column if not exists link_arquivo text;
+-- alter table tb_lotes_batch add column if not exists nome_arquivo_zip text;

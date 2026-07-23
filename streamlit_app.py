@@ -670,11 +670,11 @@ def process_zip_batch_sync(zip_bytes, catalogo, force=False, on_item=None, proce
     return contagem
 
 
-def submit_batch(batch_requests, itens):
+def submit_batch(batch_requests, itens, nome_arquivo_zip=None):
     if not batch_requests:
         return None
     batch = _claude_client.messages.batches.create(requests=batch_requests)
-    db.upsert_lote_batch(sb, batch.id, batch.processing_status, len(itens), itens)
+    db.upsert_lote_batch(sb, batch.id, batch.processing_status, len(itens), itens, nome_arquivo_zip=nome_arquivo_zip)
     return batch.id
 
 
@@ -854,11 +854,14 @@ st.divider()
 # ---------------------------------------------------------------------------
 st.subheader("Processamento em lote (ZIP)")
 st.caption(
-    "Envie um .zip com uma pasta por processo de auditoria — os PDFs daquele processo podem estar "
-    "soltos na pasta ou em subpastas dentro dela."
+    "Envie um ou mais .zip, cada um com uma pasta por processo de auditoria — os PDFs daquele processo "
+    "podem estar soltos na pasta ou em subpastas dentro dela. Cada .zip enviado vira um lote independente: "
+    "um erro em um lote não afeta os demais."
 )
 
-zip_file = st.file_uploader("ZIP com as pastas de processo", type=["zip"], key="zip_lote")
+zip_files = st.file_uploader(
+    "ZIP com as pastas de processo", type=["zip"], key="zip_lote", accept_multiple_files=True,
+)
 force_reprocess_lote = st.checkbox(
     "Forçar reprocessamento no lote (mesmo se já processado antes)",
     key="force_lote",
@@ -867,26 +870,33 @@ force_reprocess_lote = st.checkbox(
 if LLM_PROVIDER == "claude":
     st.caption("Usa a Batch API da Anthropic — metade do custo por token, resultado sai em até 24h (geralmente bem menos).")
 
-    if zip_file is not None and st.button("Preparar e enviar lote (Batch API)", type="primary"):
+    if zip_files and st.button(f"Preparar e enviar {len(zip_files)} lote(s) (Batch API)", type="primary"):
         if not catalogo:
             st.error("Envie o catálogo CSV do SEI acima antes de montar o lote — sem ele, todos os arquivos seriam descartados por não estarem mapeados.")
         else:
             processos_reprocessar = db.fetch_processos_reprocessar(sb)
-            with st.spinner("Lendo o ZIP e montando as requisições..."):
-                batch_requests, itens, contagem = prepare_batch_from_zip(zip_file.getvalue(), catalogo, force=force_reprocess_lote, processos_reprocessar=processos_reprocessar)
-            st.write(
-                f"📦 {contagem['enviado']} arquivo(s) para a IA · "
-                f"🗑️ {contagem['descartado']} descartado(s) pelo catálogo · "
-                f"📎 {contagem.get('anexo_lido', 0)} anexo(s) referenciado(s) lido(s) · "
-                f"↩️ {contagem['duplicado']} já processado(s) antes · "
-                f"❌ {contagem['erro']} sem texto extraível"
-            )
-            if batch_requests:
-                with st.spinner("Enviando lote para a Batch API..."):
-                    id_lote = submit_batch(batch_requests, itens)
-                st.success(f"Lote enviado: `{id_lote}` — volte aqui mais tarde para verificar o resultado.")
-            else:
-                st.info("Nenhum arquivo precisou da IA neste ZIP — nada foi enviado à Batch API.")
+            for zip_file in zip_files:
+                st.markdown(f"**{zip_file.name}**")
+                try:
+                    with st.spinner(f"Lendo {zip_file.name} e montando as requisições..."):
+                        batch_requests, itens, contagem = prepare_batch_from_zip(
+                            zip_file.getvalue(), catalogo, force=force_reprocess_lote, processos_reprocessar=processos_reprocessar,
+                        )
+                    st.write(
+                        f"📦 {contagem['enviado']} arquivo(s) para a IA · "
+                        f"🗑️ {contagem['descartado']} descartado(s) pelo catálogo · "
+                        f"📎 {contagem.get('anexo_lido', 0)} anexo(s) referenciado(s) lido(s) · "
+                        f"↩️ {contagem['duplicado']} já processado(s) antes · "
+                        f"❌ {contagem['erro']} sem texto extraível"
+                    )
+                    if batch_requests:
+                        with st.spinner(f"Enviando {zip_file.name} para a Batch API..."):
+                            id_lote = submit_batch(batch_requests, itens, nome_arquivo_zip=zip_file.name)
+                        st.success(f"Lote enviado: `{id_lote}` ({zip_file.name}) — volte aqui mais tarde para verificar o resultado.")
+                    else:
+                        st.info(f"Nenhum arquivo de {zip_file.name} precisou da IA — nada foi enviado à Batch API.")
+                except Exception as e:
+                    st.error(f"Falha ao processar {zip_file.name}: {e} — os demais lotes seguem independentes.")
 
     st.markdown("**Lotes enviados**")
     lotes = db.fetch_lotes_batch(sb)
@@ -922,33 +932,41 @@ else:
         "arquivo (agrupado por processo), aguardando cada resposta antes de seguir pro próximo."
     )
 
-    if zip_file is not None and st.button("Processar lote agora (fila síncrona)", type="primary"):
+    if zip_files and st.button(f"Processar {len(zip_files)} lote(s) agora (fila síncrona)", type="primary"):
         if not catalogo:
             st.error("Envie o catálogo CSV do SEI acima antes de processar o lote — sem ele, todos os arquivos seriam descartados por não estarem mapeados.")
         else:
-            zip_bytes = zip_file.getvalue()
-            total_itens = sum(1 for _ in _iter_zip_pdfs(zip_bytes))
-            if total_itens == 0:
-                st.info("Nenhum PDF encontrado dentro do ZIP.")
-            else:
-                processos_reprocessar = db.fetch_processos_reprocessar(sb)
-                progress = st.progress(0.0)
-                log = st.container()
-                estado = {"i": 0}
+            processos_reprocessar = db.fetch_processos_reprocessar(sb)
+            for zip_file in zip_files:
+                with st.expander(f"Lote: {zip_file.name}", expanded=True):
+                    try:
+                        zip_bytes = zip_file.getvalue()
+                        total_itens = sum(1 for _ in _iter_zip_pdfs(zip_bytes))
+                        if total_itens == 0:
+                            st.info("Nenhum PDF encontrado dentro do ZIP.")
+                            continue
 
-                def _on_item(pasta_processo, nome_arquivo, status, detalhe):
-                    estado["i"] += 1
-                    icon = {"concluido": "✅", "revisao": "⚠️", "erro": "❌", "duplicado": "↩️", "descartado": "🗑️"}.get(status, "•")
-                    log.write(f"{icon} **[{pasta_processo}] {nome_arquivo}** — {detalhe}")
-                    progress.progress(estado["i"] / total_itens)
+                        progress = st.progress(0.0)
+                        log = st.container()
+                        estado = {"i": 0}
 
-                with st.spinner(f"Processando {total_itens} arquivo(s) na fila..."):
-                    contagem = process_zip_batch_sync(zip_bytes, catalogo, force=force_reprocess_lote, on_item=_on_item, processos_reprocessar=processos_reprocessar)
-                st.success(
-                    f"Lote concluído — {contagem.get('concluido', 0)} ok, {contagem.get('revisao', 0)} revisão, "
-                    f"{contagem.get('erro', 0)} erro, {contagem.get('descartado', 0)} descartado(s), "
-                    f"{contagem.get('duplicado', 0)} já processado(s) antes."
-                )
+                        def _on_item(pasta_processo, nome_arquivo, status, detalhe):
+                            estado["i"] += 1
+                            icon = {"concluido": "✅", "revisao": "⚠️", "erro": "❌", "duplicado": "↩️", "descartado": "🗑️"}.get(status, "•")
+                            log.write(f"{icon} **[{pasta_processo}] {nome_arquivo}** — {detalhe}")
+                            progress.progress(estado["i"] / total_itens)
+
+                        with st.spinner(f"Processando {total_itens} arquivo(s) de {zip_file.name} na fila..."):
+                            contagem = process_zip_batch_sync(
+                                zip_bytes, catalogo, force=force_reprocess_lote, on_item=_on_item, processos_reprocessar=processos_reprocessar,
+                            )
+                        st.success(
+                            f"{zip_file.name} concluído — {contagem.get('concluido', 0)} ok, {contagem.get('revisao', 0)} revisão, "
+                            f"{contagem.get('erro', 0)} erro, {contagem.get('descartado', 0)} descartado(s), "
+                            f"{contagem.get('duplicado', 0)} já processado(s) antes."
+                        )
+                    except Exception as e:
+                        st.error(f"Falha ao processar {zip_file.name}: {e} — os demais lotes seguem independentes.")
 
 st.divider()
 

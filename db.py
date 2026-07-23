@@ -90,13 +90,18 @@ def fetch_pendentes(sb):
 # ---------------------------------------------------------------------------
 # tb_lotes_batch — processamento em lote via Batch API da Anthropic
 # ---------------------------------------------------------------------------
-def upsert_lote_batch(sb, id_lote, status, total_itens, itens_json):
-    sb.table("tb_lotes_batch").upsert({
+def upsert_lote_batch(sb, id_lote, status, total_itens, itens_json, nome_arquivo_zip=None):
+    payload = {
         "id_lote": id_lote,
         "status": status,
         "total_itens": total_itens,
         "itens_json": itens_json,
-    }).execute()
+    }
+    # só inclui se informado — evita apagar o nome já gravado quando esta
+    # função é chamada de novo só pra atualizar status (process_pending_batches)
+    if nome_arquivo_zip is not None:
+        payload["nome_arquivo_zip"] = nome_arquivo_zip
+    sb.table("tb_lotes_batch").upsert(payload).execute()
 
 
 def fetch_lotes_batch(sb, status_excluir=None):
