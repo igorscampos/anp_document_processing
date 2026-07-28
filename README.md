@@ -1,66 +1,118 @@
-# Painel de auditorias ANP — Streamlit + Supabase
+# Painel de auditorias ANP — Microsoft Fabric
 
-App com upload de PDF, classificação/extração via Claude Haiku e gravação em
-Postgres (Supabase), com custo próximo de zero em volume baixo/médio.
+Pipeline que lê PDFs de auditoria de fiscalização da ANP, classifica/extrai dados
+estruturados via LLM (Claude ou Fabric AI Functions) e grava o resultado num Fabric SQL
+Database, rodando inteiramente dentro do Microsoft Fabric — sem UI própria. Documentos e
+evidências (PDF original + HTML com âncora por parágrafo) ficam no OneLake; os resultados se
+navegam por um relatório Power BI.
 
-## 1. Criar o banco (Supabase — gratuito)
+Esta é a versão Fabric-nativa do protótipo original (Streamlit + Supabase). A troca de
+arquitetura foi deliberada: o app deixou de ter uma tela de upload interativa — arquivos são
+processados em runs agendadas de um Data Pipeline, não na hora do upload. Veja o histórico do
+repositório se precisar da versão Streamlit/Supabase anterior.
 
-1. Crie uma conta em [supabase.com](https://supabase.com) e um novo projeto (tier Free).
-2. Vá em **SQL Editor > New query**, cole o conteúdo de `schema.sql` e rode.
-3. Vá em **Project Settings > API** e copie:
-   - `Project URL` → vai virar `SUPABASE_URL`
-   - `service_role` key (ou `anon` key, se ativar RLS depois) → vai virar `SUPABASE_KEY`
+## Arquitetura
 
-## 2. Configurar as credenciais
+| Componente | Papel |
+|---|---|
+| Lakehouse (`Files/entrada`, `Files/evidencias`, `Files/evidencias-html`, `Files/src`) | Pasta de entrada (SEI CSV + PDFs + ZIPs), arquivos originais e HTML de evidência, e os módulos `.py` do pipeline |
+| Fabric SQL Database | As 7 tabelas relacionais (`schema.tsql.sql`) |
+| Notebook (`nb_pipeline_run.ipynb` + `fabric_pipeline.py`/`db.py`/`pipeline.py`) | Toda a lógica de classificação/extração e gravação |
+| Data Pipeline agendado | Dispara o notebook periodicamente |
+| Variable Library + conexão Key Vault | Configuração e a API key da Anthropic |
+| Relatório Power BI | Navegação dos resultados (substitui as antigas abas do Streamlit) |
 
-Copie `.streamlit/secrets.toml.example` para `.streamlit/secrets.toml` e
-preencha com sua chave da Anthropic e as credenciais do Supabase.
+`pipeline.py` (extração de texto, regex, geração de HTML com âncora, catálogo CSV do SEI,
+prompts) não depende de Fabric nem de banco — é lógica pura, testável fora do Fabric também.
 
-**Nunca** commite o `secrets.toml` de verdade num repositório público — ele já
-está no formato que o Streamlit lê automaticamente, tanto local quanto no
-Community Cloud (lá você cola o conteúdo na aba "Secrets" das configurações
-do app, em vez de subir o arquivo).
+## 1. Provisionar os itens do Fabric
 
-## 3. Rodar localmente
+1. Crie um workspace com capacidade paga **F2 ou superior** (necessário se for usar o
+   caminho `fabric_ai`, e recomendado de qualquer forma).
+2. Crie um **Lakehouse** e, dentro dele, as pastas `Files/entrada`, `Files/evidencias`,
+   `Files/evidencias-html`, `Files/src`.
+3. Publique `db.py`, `pipeline.py` e `fabric_pipeline.py` deste repositório em `Files/src/`.
+4. Crie um **Fabric SQL Database** e rode `schema.tsql.sql` inteiro no editor T-SQL dele.
+   **Antes de rodar**, confira a collation do banco — escolha uma variante
+   case-insensitive/accent-insensitive (ex: `Latin1_General_100_CI_AI`), não a padrão do SQL
+   Server, ou a busca por texto em português (nomes de operadora, `numero_relatorio`) pode
+   falhar em casos com acentuação.
+5. Crie a **Variable Library** com `LLM_PROVIDER`, `ANTHROPIC_MODEL`, `CLAUDE_MAX_CHARS`,
+   `FABRIC_AI_MAX_CHARS`, `CONFIDENCE_THRESHOLD` (ver valores padrão em
+   `fabric_pipeline.get_config`).
+6. Crie uma conexão ligada ao **Azure Key Vault** guardando `ANTHROPIC_API_KEY` — nunca em
+   texto plano na Variable Library ou no notebook.
+7. Importe `nb_pipeline_run.ipynb` como Notebook do workspace, ajuste a célula de
+   configuração pra puxar da Variable Library/Key Vault reais.
+8. Crie um **Data Pipeline** com uma atividade Notebook apontando pra `nb_pipeline_run`,
+   numa recorrência (ex: diária — não há necessidade de tempo real, já que o processamento
+   deixou de ser interativo).
+9. Construa o **relatório Power BI** sobre o Fabric SQL Database, uma página por tabela
+   (`tb_auditorias`, `tb_nao_conformidades`, `tb_respostas`, `tb_evidencias`, e uma view/
+   filtro de `tb_arquivos_processados` para `status IN ('pendente_vinculo','parcial','revisao_manual','erro')`).
+
+## 2. Rodar
+
+O pipeline roda inteiro dentro da run do Notebook (`fabric_pipeline.run_pipeline()`), sem
+intervenção manual:
+1. Aplica lotes da Batch API da Anthropic já concluídos de runs anteriores.
+2. Resolve a fila de pendências (documentos vinculados fora de ordem).
+3. Varre `Files/entrada/` — processa PDFs soltos e qualquer `.zip` (cada `.zip` deve ter uma
+   pasta de 1º nível por processo de auditoria, PDFs soltos ou em subpastas dentro dela) e o
+   catálogo CSV do SEI (colunas: nº processo sei, documento, tipo_documento, data_captura,
+   status — **obrigatório**, é a fonte de verdade; qualquer arquivo fora dele é descartado
+   sem chamar a IA).
+
+Arquivos já processados não são removidos da pasta de entrada — o dedup por hash cuida disso
+automaticamente (reprocessar o mesmo PDF é um no-op, sem gastar token de novo).
+
+### Escolher o provedor de LLM
+
+`LLM_PROVIDER` na Variable Library:
+- `"claude"` (padrão) — API da Anthropic. PDFs soltos usam a API síncrona; ZIPs usam a Batch
+  API (metade do custo por token, resultado aplicado numa run futura, pode levar até 24h).
+- `"fabric_ai"` — Fabric AI Functions (`synapse.ml.aifunc`), sem custo de API key separada
+  (cobrado via capacidade Fabric). Sem equivalente de Batch API — ZIPs processam em fila
+  síncrona, arquivo por arquivo. Exige capacidade F2+ e o tenant switch de Copilot/Azure
+  OpenAI habilitado — confirme com o admin do tenant antes de usar em produção.
+
+### Forçar reprocessamento de um processo
+
+Não há mais checkbox — é uma ação deliberada, direta no banco:
+```sql
+INSERT INTO tb_processos_reprocessar (numero_processo_anp) VALUES ('48610.221768/2025-20');
+```
+Só funciona automaticamente se o(s) arquivo(s) daquele processo ainda estiverem em
+`Files/entrada/` (já que arquivos processados não são movidos por padrão) — se já tiverem
+sido limpos de lá, é preciso soltar o PDF de novo na pasta antes da próxima run.
+
+## Riscos conhecidos (confirmar antes de ir pra produção)
+
+- **Egresso de rede** do Notebook para `api.anthropic.com` pode estar bloqueado por política
+  de tenant — confirme com o admin antes de assumir Claude como caminho viável.
+- **Fabric AI Functions** exige capacidade F2+ e o switch de Copilot/Azure OpenAI habilitado
+  no tenant — sem isso, `LLM_PROVIDER="fabric_ai"` não funciona.
+- **Links de evidência** (`link_arquivo`/`link_evidencia`) agora são caminhos OneLake, não
+  URLs públicas — só abrem pra quem tem acesso ao workspace Fabric. Mais seguro que o bucket
+  público do protótipo anterior, mas mais restritivo: confirme se auditores/operadoras
+  externas dependiam do link público antes.
+- **Driver ODBC 18 para SQL Server** pode não vir pré-instalado na imagem padrão do runtime
+  do notebook — pode exigir um Fabric Environment customizado além do `%pip install pyodbc`.
+- **Qualidade de extração do modelo padrão do Fabric AI Functions** nesses PDFs longos e
+  densos em português não está validada — compare lado a lado com o caminho Claude antes de
+  confiar nele em produção.
+- **Migração de dados históricos** de uma instalação Supabase anterior não está automatizada
+  aqui — os IDs são texto gerado em Python (`AUD-`/`NC-`/`RESP-`/`EVID-<hex>`), então são
+  portáveis via export/import manual se for preciso preservar histórico.
+
+## Desenvolvimento local
+
+`pipeline.py` não tem dependência de Fabric/banco — dá pra testar a extração de texto, regex
+de processo, geração de HTML com âncora e os prompts isoladamente. `db.py`/`fabric_pipeline.py`
+precisam de `FABRIC_SQL_SERVER`/`FABRIC_SQL_DATABASE` (com uma identidade autenticada via
+`DefaultAzureCredential`, ex: `az login`) e de `/lakehouse/default/Files` existir localmente
+(ou aponte `LAKEHOUSE_FILES_ROOT` pra uma pasta local qualquer) pra rodar fora do Fabric.
 
 ```bash
-python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-streamlit run app.py
 ```
-
-Abre em `http://localhost:8501`.
-
-## 4. Publicar de graça (Streamlit Community Cloud)
-
-1. Suba esta pasta para um repositório no GitHub (pode ser privado).
-2. Vá em [share.streamlit.io](https://share.streamlit.io), conecte sua conta
-   do GitHub e escolha o repositório + `app.py` como arquivo principal.
-3. Em **Advanced settings > Secrets**, cole o conteúdo do seu
-   `.streamlit/secrets.toml` real.
-4. Deploy. Você recebe uma URL pública (`seu-app.streamlit.app`) que qualquer
-   pessoa da equipe pode acessar para fazer upload dos PDFs.
-
-Isso cobre hospedagem, upload, processamento e banco por **US$ 0/mês** de
-infraestrutura — o único custo real é o consumo de tokens da API da Anthropic.
-
-## 5. Segurança antes de usar com dados sensíveis
-
-Este protótipo desativa Row Level Security (RLS) no Supabase para simplificar
-os testes. Antes de expor publicamente com dados reais de auditoria:
-
-- Ative RLS nas 4 tabelas e crie policies restringindo leitura/escrita.
-- Considere colocar autenticação no app (Streamlit Community Cloud tem opção
-  de restringir acesso por e-mail/domínio nas configurações do app).
-- Use a `anon key` do Supabase (não a `service_role`) se o app for público,
-  e restrinja permissões via RLS em vez de confiar só na chave.
-
-## 6. Próximos passos possíveis
-
-- Trocar chamadas síncronas pela **Batch API** da Anthropic para cortar mais
-  50% do custo — exige um worker separado que envia os lotes e outro que
-  busca os resultados depois (não cabe no modelo simples de "upload e vê na
-  hora" do Streamlit, mas dá para rodar como um cron job à parte enquanto o
-  Streamlit só lê os resultados já prontos do banco).
-- Adicionar OCR (`pytesseract`) para PDFs escaneados como imagem.
-- Adicionar autenticação de usuário nativa do Streamlit ou do Supabase Auth.

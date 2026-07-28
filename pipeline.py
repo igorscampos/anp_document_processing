@@ -23,6 +23,7 @@ três coisas, ANTES de chamar a IA:
 """
 
 import csv
+import html as html_lib
 import io
 import re
 
@@ -96,6 +97,119 @@ def extract_text(file_bytes, max_chars):
         for page in pdf.pages:
             parts.append(page.extract_text() or "")
     return "\n".join(parts)[:max_chars]
+
+
+def extract_pages(file_bytes):
+    """Texto de cada página, separado (sem concatenar/truncar) — usado pra dar
+    à IA uma pista de página aproximada de cada evidência (via
+    `montar_texto_paginado`) e, depois, pra gerar o HTML com âncora por
+    parágrafo do documento-fonte (`gerar_html_documento`)."""
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        return [page.extract_text() or "" for page in pdf.pages]
+
+
+def montar_texto_paginado(paginas, max_chars):
+    """Junta o texto de `extract_pages` com marcador de página — é o texto
+    que vai pro prompt da IA quando queremos que ela informe
+    `pagina_aproximada` de uma evidência. Não substitui `extract_text`, que
+    continua sendo usado onde marcação de página não importa (ex: regex de
+    número de processo)."""
+    partes = [f"[página {i}]\n{p}" for i, p in enumerate(paginas, start=1)]
+    return "\n\n".join(partes)[:max_chars]
+
+
+# ---------------------------------------------------------------------------
+# HTML do documento-fonte, com um <p id="..."> por parágrafo — usado pra
+# linkar a evidência direto no trecho onde ela foi capturada (`#id` no link),
+# em vez do PDF inteiro. Não depende de nenhuma lib de renderização de PDF:
+# só reaproveita o texto que o pdfplumber já extrai.
+# ---------------------------------------------------------------------------
+def montar_chunks_pagina(texto_pagina):
+    """Quebra o texto de UMA página em parágrafos, por linha em branco; se a
+    página não tiver nenhuma linha em branco, cada linha vira um parágrafo
+    próprio. Cada bloco resultante é um candidato a âncora."""
+    blocos = [b.strip() for b in re.split(r"\n\s*\n", texto_pagina.strip()) if b.strip()]
+    if len(blocos) <= 1 and "\n" in texto_pagina.strip():
+        blocos = [l.strip() for l in texto_pagina.strip().split("\n") if l.strip()]
+    return blocos
+
+
+def gerar_html_documento(paginas):
+    """paginas: list[str] (uma por página, de `extract_pages`). Devolve
+    (html_str, chunks), onde chunks é list[(id, texto)] na ordem do documento
+    — usado por `localizar_ancora` pra achar o parágrafo de um trecho citado.
+
+    Todo texto extraído do PDF passa por `html.escape` antes de virar HTML —
+    é conteúdo de terceiros, não confiável (evita que um PDF com "<script>"
+    ou "<img onerror=...>" no texto vire XSS quando alguém abrir o link).
+    """
+    partes = [
+        "<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><style>",
+        "body{font-family:sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem;line-height:1.5}",
+        "p{scroll-margin-top:1rem}",
+        ":target{background:#fff3a0;outline:2px solid #d4a017;padding:2px}",
+        ".pagina{color:#888;font-size:.8em;border-top:1px solid #ccc;margin-top:2rem;padding-top:.5rem}",
+        "</style></head><body>",
+    ]
+    chunks = []
+    for num_pagina, texto_pagina in enumerate(paginas, start=1):
+        partes.append(f"<div class='pagina'>página {num_pagina}</div>")
+        for i, bloco in enumerate(montar_chunks_pagina(texto_pagina)):
+            _id = f"p{num_pagina}-{i}"
+            partes.append(f"<p id='{_id}'>{html_lib.escape(bloco)}</p>")
+            chunks.append((_id, bloco))
+    partes.append("</body></html>")
+    return "".join(partes), chunks
+
+
+def _norm_busca(texto):
+    return re.sub(r"\s+", " ", (texto or "")).strip().lower()
+
+
+def localizar_ancora(chunks, trecho_original, pagina_aproximada=None):
+    """Acha o id do parágrafo (de `chunks`, gerado por `gerar_html_documento`)
+    que contém `trecho_original` — comparação normalizada por espaço,
+    case-insensitive. Tenta o trecho inteiro e, se não achar, só a primeira
+    linha dele (quebra de linha do PDF renderizado às vezes não bate com a
+    citação inteira da IA). Sem match por texto, cai pro primeiro parágrafo da
+    `pagina_aproximada`, se informada. Devolve (id, numero_pagina, tipo) ou
+    `None` — tipo é "ancora_precisa" ou "ancora_pagina".
+    """
+    candidatos = []
+    if trecho_original:
+        alvo = _norm_busca(trecho_original)
+        if alvo:
+            candidatos.append(alvo)
+        linhas = trecho_original.strip().splitlines()
+        if linhas:
+            primeira_linha = _norm_busca(linhas[0])
+            if primeira_linha and primeira_linha not in candidatos:
+                candidatos.append(primeira_linha)
+
+    for alvo in candidatos:
+        for _id, texto in chunks:
+            if alvo in _norm_busca(texto):
+                pagina = int(_id.split("-")[0][1:])
+                return _id, pagina, "ancora_precisa"
+
+    if pagina_aproximada:
+        for _id, texto in chunks:
+            pagina = int(_id.split("-")[0][1:])
+            if pagina == pagina_aproximada:
+                return _id, pagina, "ancora_pagina"
+
+    return None
+
+
+_REGEX_DATA_ISO = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def normalize_data_iso(valor):
+    """Valida que `valor` já veio da IA no formato AAAA-MM-DD — devolve None
+    se vier em outro formato (a IA às vezes erra apesar da instrução), em vez
+    de tentar adivinhar/parsear datas em português."""
+    valor = (valor or "").strip()
+    return valor if _REGEX_DATA_ISO.match(valor) else None
 
 
 # ---------------------------------------------------------------------------
@@ -297,11 +411,15 @@ Formato exato:
   "confianca": 0.0,
   "numero_processo_anp": "string ou null",
   "numero_relatorio": "string ou null",
+  "data_emissao_documento": "AAAA-MM-DD ou null",
   "auditoria": null,
   "nao_conformidades": [],
   "respostas": []
 }}
 {dica_tipo_sei}
+data_emissao_documento: a data de emissão/assinatura do PRÓPRIO documento (capa, cabeçalho ou
+campo de assinatura) — não confundir com data_auditoria_inicio/data_auditoria_fim (que são do
+período fiscalizado, não da emissão deste documento). Use null se não encontrar. Formato AAAA-MM-DD.
 Preencha "auditoria" (objeto com codigo_auditoria_anp, ordem_servico, operadora, cnpj_operadora,
 unidade_instalacao, tipo_auditoria, sumario_auditoria, acao_demandada, data_auditoria_inicio,
 data_auditoria_fim, data_emissao_relatorio, auditor_responsavel, auditores_equipe, status_auditoria,
@@ -361,9 +479,10 @@ não encontrar) — não confundir com a data da não conformidade original.
 {dica_ncs_existentes}
 
 EVIDÊNCIAS — tanto em "nao_conformidades" quanto em "respostas", cada não conformidade normalmente
-tem VÁRIAS evidências. "evidencias" é um array de {{descricao, apresentado_por}} — capture TODAS as
-evidências distintas relacionadas àquele item específico (use array vazio [] se não houver nenhuma
-pra esse item — nunca invente uma evidência que não esteja no texto):
+tem VÁRIAS evidências. "evidencias" é um array de {{descricao, apresentado_por, sistema, equipamento,
+categoria, trecho_original, pagina_aproximada}} — capture TODAS as evidências distintas relacionadas
+àquele item específico (use array vazio [] se não houver nenhuma pra esse item — nunca invente uma
+evidência que não esteja no texto):
 - descricao: PRIORIZE o dado concreto e específico já descrito no próprio texto — medições, datas de
   ocorrências, quantidades, resultados de teste, contagens, fotos/registros mencionados — em vez de um
   resumo genérico. Exemplos de BOA descricao: "9 vazamentos de gás detectados desde 2022, incluindo 1
@@ -379,12 +498,25 @@ pra esse item — nunca invente uma evidência que não esteja no texto):
   da operadora, anexos técnicos enviados por ela em resposta a uma notificação); "anp" se foi a
   própria ANP quem produziu/observou a evidência (ex: registro da fiscalização, laudo do auditor,
   parecer técnico anterior). Use null só se o texto não deixar claro quem apresentou.
+- sistema: o sistema/subsistema operacional citado no trecho da evidência (ex: "sistema de alívio e
+  queima", "sistema de drenagem de água oleosa", "sistema de detecção de gás"), em texto livre. Use
+  null se o texto não deixar claro.
+- equipamento: o equipamento específico citado (tag ou nome, ex: "PSV-101", "tanque de espuma TQ-04",
+  "detector de gás nível HH"), em texto livre. Use null se o texto não deixar claro.
+- categoria: a natureza da evidência em 1-3 palavras (ex: "fotográfico", "medição", "documental",
+  "registro de teste", "entrevista", "relatório técnico"). Use null se não for possível classificar.
+- trecho_original: cópia LITERAL (não parafraseada, sem resumir) de um trecho curto e contíguo do
+  texto do documento que sustenta esta evidência — o mesmo trecho usado como base pra "descricao".
+  Copie exatamente como está no texto, inclusive pontuação. Use null se a evidência for uma síntese
+  sem um trecho citável direto.
+- pagina_aproximada: o número inteiro da página (dos marcadores "[página N]" no texto abaixo) onde
+  esse trecho está. Use null se não for possível saber.
 - Cuidado para não misturar evidências de itens diferentes: associe cada evidência apenas ao
   numero_item que o próprio texto vincula a ela, não à lista inteira de referências do documento.
 
 Responda APENAS o JSON, começando com {{ e terminando com }}, sem nenhum texto antes ou depois.
 
-TEXTO DO DOCUMENTO (pode estar truncado):
+TEXTO DO DOCUMENTO (pode estar truncado; marcado com "[página N]" no início de cada página):
 ---
 {texto}
 ---
@@ -479,7 +611,9 @@ seguinte não conformidade:
 Não conformidade: {contexto_nc}
 
 Analise o texto do anexo e responda SOMENTE com JSON válido, sem markdown, no formato exato:
-{{"evidencias": [{{"descricao": "string", "apresentado_por": "anp|operadora|null"}}]}}
+{{"evidencias": [{{"descricao": "string", "apresentado_por": "anp|operadora|null", "sistema": "string ou null",
+"equipamento": "string ou null", "categoria": "string ou null", "trecho_original": "string ou null",
+"pagina_aproximada": 0}}]}}
 
 Extraia TODAS as evidências específicas (observações, medições, datas, ocorrências, fotos
 mencionadas) descritas neste anexo que sustentem essa não conformidade — uma entrada por evidência
@@ -487,7 +621,16 @@ distinta, priorizando o dado concreto (ex: "Vazamento ativo em linha de offloadi
 [data/local]" em vez de um resumo genérico). Use array vazio [] se o anexo não tiver relação com a
 não conformidade. Nunca invente uma evidência que não esteja no texto do anexo.
 
-TEXTO DO ANEXO (pode estar truncado):
+- sistema/equipamento: sistema operacional e equipamento específico (tag/nome) citados no trecho,
+  em texto livre; null se o texto não deixar claro.
+- categoria: natureza da evidência em 1-3 palavras (ex: "fotográfico", "medição", "documental");
+  null se não for possível classificar.
+- trecho_original: cópia LITERAL de um trecho curto e contíguo do texto do anexo que sustenta a
+  evidência — o mesmo usado como base pra "descricao". Null se não houver trecho citável direto.
+- pagina_aproximada: número inteiro da página (dos marcadores "[página N]" no texto abaixo) onde
+  esse trecho está; null se não for possível saber.
+
+TEXTO DO ANEXO (pode estar truncado; marcado com "[página N]" no início de cada página):
 ---
 {texto}
 ---

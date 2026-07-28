@@ -1,12 +1,14 @@
 {
   "name": "Python 3.11",
-  // Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
+  // Ambiente só para desenvolvimento/teste local da lógica (pipeline.py, db.py,
+  // fabric_pipeline.py) — a execução de produção acontece num Notebook do Microsoft Fabric,
+  // não aqui. Ver README.md para o runbook de provisionamento/deploy no Fabric.
   "image": "mcr.microsoft.com/devcontainers/python:1.0-3.14-bookworm",
   "customizations": {
     "codespaces": {
       "openFiles": [
         "README.md",
-        "streamlit_app.py"
+        "fabric_pipeline.py"
       ]
     },
     "vscode": {
@@ -17,17 +19,5 @@
       ]
     }
   },
-  "updateContentCommand": "if [ -f packages.txt ]; then sudo apt update && sudo apt upgrade -y && sudo xargs apt install -y < packages.txt; fi; if ! command -v uv >/dev/null 2>&1; then curl -LsSf https://astral.sh/uv/install.sh | sh; fi; UV_BIN=$(command -v uv || echo \"$HOME/.local/bin/uv\"); UV_PROJECT_ENVIRONMENT=\"$HOME/.venvs/blank-app-template\" \"$UV_BIN\" sync",
-  "postAttachCommand": {
-    "server": "UV_BIN=$(command -v uv || echo \"$HOME/.local/bin/uv\"); UV_PROJECT_ENVIRONMENT=\"$HOME/.venvs/blank-app-template\" \"$UV_BIN\" run streamlit run streamlit_app.py --server.enableCORS false --server.enableXsrfProtection false"
-  },
-  "portsAttributes": {
-    "8501": {
-      "label": "Application",
-      "onAutoForward": "openPreview"
-    }
-  },
-  "forwardPorts": [
-    8501
-  ]
+  "updateContentCommand": "if [ -f packages.txt ]; then sudo apt update && sudo apt upgrade -y && sudo xargs apt install -y < packages.txt; fi; if ! command -v uv >/dev/null 2>&1; then curl -LsSf https://astral.sh/uv/install.sh | sh; fi; UV_BIN=$(command -v uv || echo \"$HOME/.local/bin/uv\"); UV_PROJECT_ENVIRONMENT=\"$HOME/.venvs/anp-document-processing\" \"$UV_BIN\" sync"
 }
