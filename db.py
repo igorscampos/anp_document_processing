@@ -60,10 +60,10 @@ def upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo_documento, confianca
 
 
 def fetch_link_arquivo(sb, numero_sei):
-    """Link do Storage de um arquivo já processado, buscado pelo número SEI
-    (nome do arquivo sem extensão) — usado pra resolver o link de uma
-    evidência pro arquivo que realmente tem o detalhe, não pro documento
-    principal que só cita esse número."""
+    """Link do Storage (PDF original) de um arquivo já processado, buscado
+    pelo número SEI (nome do arquivo sem extensão) — usado pra resolver o
+    link de uma evidência pro arquivo que realmente tem o detalhe (não pro
+    documento principal que só cita esse número)."""
     if not numero_sei:
         return None
     res = (
@@ -141,7 +141,7 @@ CAMPOS_AUDITORIA = {
     "operadora", "cnpj_operadora", "unidade_instalacao", "tipo_auditoria",
     "sumario_auditoria", "acao_demandada", "data_auditoria_inicio", "data_auditoria_fim",
     "data_emissao_relatorio", "auditor_responsavel", "auditores_equipe", "status_auditoria",
-    "resultado_final",
+    "resultado_final", "praticas_auditadas", "documentos_solicitados", "fonte_auditoria",
 }
 
 
@@ -188,10 +188,16 @@ def find_nc(sb, id_auditoria, numero_item):
 
 
 def fetch_ncs_resumo(sb, id_auditoria):
-    """numero_item + descricao de cada NC da auditoria — usado pra dar
-    contexto à IA (no prompt principal ou no re-casamento) sem precisar
-    buscar a linha inteira."""
-    res = sb.table("tb_nao_conformidades").select("numero_item,descricao").eq("id_auditoria", id_auditoria).execute()
+    """numero_item + descricao (+ categoria/elemento_critico, usados pelo
+    filtro local de relevância de Anexo, ver `pipeline.filtrar_ncs_relevantes`)
+    de cada NC da auditoria — usado pra dar contexto à IA (no prompt
+    principal ou no re-casamento) sem precisar buscar a linha inteira."""
+    res = (
+        sb.table("tb_nao_conformidades")
+        .select("numero_item,descricao,categoria_nao_conformidade,elemento_critico")
+        .eq("id_auditoria", id_auditoria)
+        .execute()
+    )
     return [row for row in res.data if row.get("numero_item")]
 
 
@@ -205,6 +211,9 @@ def upsert_nc(sb, id_auditoria, nc, arquivo_origem, link_arquivo=None):
             "classificacao_gravidade": nc.get("classificacao_gravidade") or existente.get("classificacao_gravidade"),
             "acao_recomendada": nc.get("acao_recomendada") or existente.get("acao_recomendada"),
             "prazo_correcao": nc.get("prazo_correcao") or existente.get("prazo_correcao"),
+            "severidade": nc.get("severidade") or existente.get("severidade"),
+            "frequencia": nc.get("frequencia") or existente.get("frequencia"),
+            "elemento_critico": nc.get("elemento_critico") or existente.get("elemento_critico"),
         }).eq("id_nao_conformidade", existente["id_nao_conformidade"]).execute()
         id_nc = existente["id_nao_conformidade"]
     else:
@@ -219,6 +228,9 @@ def upsert_nc(sb, id_auditoria, nc, arquivo_origem, link_arquivo=None):
             "classificacao_gravidade": nc.get("classificacao_gravidade"),
             "acao_recomendada": nc.get("acao_recomendada"),
             "prazo_correcao": nc.get("prazo_correcao"),
+            "severidade": nc.get("severidade"),
+            "frequencia": nc.get("frequencia"),
+            "elemento_critico": nc.get("elemento_critico"),
             "status_atual": "pendente de resposta",
             "arquivo_origem": arquivo_origem,
         }).execute()
@@ -243,11 +255,12 @@ def insert_resposta(sb, id_nc, id_auditoria, tipo_registro, r, arquivo_origem, l
         "data_resposta": r.get("data_resposta"),
         "arquivo_origem": arquivo_origem,
     }).execute()
-    # Evidência só é registrada pra resposta da OPERADORA — parecer da ANP não
-    # gera linha em tb_evidencias (evidência é sempre algo apresentado pela
-    # operadora em resposta, ou o próprio achado do DF).
-    if tipo_registro == "resposta_operadora":
-        insert_evidencias(sb, r.get("evidencias"), arquivo_origem, id_resposta=id_resposta, link_arquivo=link_arquivo)
+    # Evidência é qualquer informação que sustente a não conformidade —
+    # independente de quem apresentou (a origem já fica registrada por
+    # evidência em "apresentado_por", anp ou operadora). Por isso grava pra
+    # qualquer tipo_registro, não só resposta_operadora: um parecer_anp
+    # normalmente cita evidência que a própria ANP levantou/observou.
+    insert_evidencias(sb, r.get("evidencias"), arquivo_origem, id_resposta=id_resposta, link_arquivo=link_arquivo)
     if r.get("resultado_final"):
         sb.table("tb_nao_conformidades").update(
             {"status_atual": r.get("resultado_final")}
@@ -287,14 +300,20 @@ def insert_evidencias(sb, evidencias, arquivo_origem, id_nao_conformidade=None, 
     "evidencias" é o array bruto que a IA devolveu — trata formatos
     imperfeitos (string solta em vez de objeto, valor de apresentado_por fora
     do esperado) sem quebrar, e evita duplicar a mesma evidência se o mesmo
-    item for reprocessado ou citado de novo por outro documento.
+    item for reprocessado ou citado de novo por outro documento. Se a
+    evidência já existe (mesma descrição) mas o link salvo é de um formato
+    antigo (HTML, de antes do recorte em PDF), atualiza só o link em vez de
+    pular — sem isso, reprocessar um documento nunca corrigia o link de
+    evidências cuja descrição a IA volta a extrair igual.
 
     Pra cada evidência, tenta achar (via regex, ver `_extrai_arquivo_referenciado`)
     um número SEI citado na própria descrição — se achar E já existir o link
     daquele arquivo em `tb_arquivos_processados` (`fetch_link_arquivo`), o
     link da evidência aponta pro arquivo QUE TEM o detalhe, não pro
     documento atual (`link_arquivo`, usado só como fallback quando não há
-    nada mais específico pra apontar).
+    nada mais específico pra apontar — já vem resolvido pelo chamador, ver
+    `_build_links_por_item` em streamlit_app.py: PDF de 1 página recortado na
+    posição certa, quando conhecida, senão o PDF completo).
     """
     if not evidencias:
         return
@@ -303,12 +322,12 @@ def insert_evidencias(sb, evidencias, arquivo_origem, id_nao_conformidade=None, 
     if not isinstance(evidencias, list):
         return
 
-    query = sb.table("tb_evidencias").select("descricao")
+    query = sb.table("tb_evidencias").select("id_evidencia,descricao,link_evidencia")
     if id_nao_conformidade:
         query = query.eq("id_nao_conformidade", id_nao_conformidade)
     else:
         query = query.eq("id_resposta", id_resposta)
-    ja_registradas = {_norm(row.get("descricao")) for row in query.execute().data}
+    existentes = {_norm(row.get("descricao")): row for row in query.execute().data}
 
     for ev in evidencias:
         if isinstance(ev, str):
@@ -316,7 +335,7 @@ def insert_evidencias(sb, evidencias, arquivo_origem, id_nao_conformidade=None, 
         if not isinstance(ev, dict):
             continue
         descricao = (ev.get("descricao") or "").strip()
-        if not descricao or _norm(descricao) in ja_registradas:
+        if not descricao:
             continue
 
         arquivo_referenciado = _extrai_arquivo_referenciado(descricao)
@@ -326,38 +345,40 @@ def insert_evidencias(sb, evidencias, arquivo_origem, id_nao_conformidade=None, 
             if link_referenciado:
                 link_evidencia = link_referenciado
 
+        existente = existentes.get(_norm(descricao))
+        if existente:
+            link_atual = existente.get("link_evidencia") or ""
+            if link_evidencia and ".html" in link_atual:
+                sb.table("tb_evidencias").update(
+                    {"link_evidencia": link_evidencia}
+                ).eq("id_evidencia", existente["id_evidencia"]).execute()
+            continue
+
+        id_evidencia = gen_id("EVID")
         sb.table("tb_evidencias").insert({
-            "id_evidencia": gen_id("EVID"),
+            "id_evidencia": id_evidencia,
             "id_nao_conformidade": id_nao_conformidade,
             "id_resposta": id_resposta,
             "apresentado_por": _normaliza_apresentado_por(ev.get("apresentado_por")),
             "descricao": descricao,
             "arquivo_referenciado": arquivo_referenciado,
             "link_evidencia": link_evidencia,
+            "sistema_evidencia": ev.get("sistema_evidencia"),
+            "equipamento_evidencia": ev.get("equipamento_evidencia"),
+            "categoria_evidencia": ev.get("categoria_evidencia"),
+            "descritivo_imagens": ev.get("descritivo_imagens"),
             "arquivo_origem": arquivo_origem,
         }).execute()
-        ja_registradas.add(_norm(descricao))
-
-
-def fetch_evidencias_por_anexo(sb, numero_sei):
-    """Não conformidades que citaram este número SEI como fonte de mais
-    detalhe (via `arquivo_referenciado`) — usado pra decidir, ANTES de
-    descartar um arquivo tipo "Anexo", se vale a pena lê-lo."""
-    if not numero_sei:
-        return []
-    res = (
-        sb.table("tb_evidencias")
-        .select("id_nao_conformidade,descricao")
-        .eq("arquivo_referenciado", numero_sei)
-        .not_.is_("id_nao_conformidade", "null")
-        .execute()
-    )
-    return res.data
+        existentes[_norm(descricao)] = {"id_evidencia": id_evidencia, "descricao": descricao, "link_evidencia": link_evidencia}
 
 
 # ---------------------------------------------------------------------------
-# Supabase Storage — evidências são salvas como o PDF de origem inteiro,
-# disponibilizado por link público (não um recorte de página).
+# Supabase Storage — cada documento sobe o PDF de origem inteiro (trilha de
+# auditoria, link em `link_arquivo`); além disso, sob demanda, recortes de 1
+# página são gerados e subidos separadamente (link de evidência, em
+# `link_evidencia` — ver `pipeline.build_page_pdf` e `_build_links_por_item`
+# em streamlit_app.py), pra apontar direto na página onde a evidência foi
+# encontrada, com a formatação real do documento preservada.
 # ---------------------------------------------------------------------------
 BUCKET_EVIDENCIAS = "evidencias"
 
@@ -388,6 +409,26 @@ def upload_evidencia_arquivo(sb, file_bytes, file_hash, nome_arquivo, bucket=BUC
     caminho = f"{file_hash}.{extensao}"
     sb.storage.from_(bucket).upload(
         caminho, file_bytes,
+        file_options={"content-type": "application/pdf", "upsert": "true"},
+    )
+    return sb.storage.from_(bucket).get_public_url(caminho)
+
+
+def upload_evidencia_pagina(sb, pagina_bytes, file_hash, pagina, bucket=BUCKET_EVIDENCIAS):
+    """Sobe um PDF de 1 página (recortado do documento original, ver
+    `pipeline.build_page_pdf`) pro Storage e devolve a URL pública — usado
+    como link de evidência: mantém a formatação real do documento (tabelas,
+    carimbos, texto selecionável), recortado na página certa em vez do PDF
+    inteiro ou de uma reconstrução em HTML.
+
+    Nome do objeto inclui a página (`{file_hash}_p{pagina}.pdf`) — se dois
+    itens diferentes apontarem pra mesma página, o upsert reaproveita o
+    mesmo objeto em vez de duplicar.
+    """
+    ensure_bucket(sb, bucket)
+    caminho = f"{file_hash}_p{pagina}.pdf"
+    sb.storage.from_(bucket).upload(
+        caminho, pagina_bytes,
         file_options={"content-type": "application/pdf", "upsert": "true"},
     )
     return sb.storage.from_(bucket).get_public_url(caminho)

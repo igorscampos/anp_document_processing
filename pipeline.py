@@ -27,6 +27,7 @@ import io
 import re
 
 import pdfplumber
+import pypdfium2 as pdfium
 
 # ---------------------------------------------------------------------------
 # Número de processo ANP — extração determinística por regex
@@ -90,12 +91,71 @@ def extract_processo_from_foldername(nome_pasta):
 # ---------------------------------------------------------------------------
 # Extração de texto
 # ---------------------------------------------------------------------------
-def extract_text(file_bytes, max_chars):
-    parts = []
+def extract_pages(file_bytes):
+    """Texto de cada página do PDF, sem truncar — uma entrada por página.
+
+    Usado tanto para montar o texto completo (`extract_text`, truncado pro
+    limite de tokens do prompt) quanto para gerar a versão HTML navegável do
+    documento e localizar em qual página um item foi citado."""
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            parts.append(page.extract_text() or "")
-    return "\n".join(parts)[:max_chars]
+        return [page.extract_text() or "" for page in pdf.pages]
+
+
+def extract_text(file_bytes, max_chars):
+    return "\n".join(extract_pages(file_bytes))[:max_chars]
+
+
+def build_page_pdf(file_bytes, pagina):
+    """Recorta UMA página (1-based) do PDF original como um PDF novo,
+    standalone — usado como link de evidência em vez de HTML reconstruído a
+    partir de texto puro (que perde tabela/coluna/carimbo/layout): mantém a
+    formatação real do documento, com texto ainda selecionável/pesquisável."""
+    src = pdfium.PdfDocument(file_bytes)
+    try:
+        dst = pdfium.PdfDocument.new()
+        try:
+            dst.import_pages(src, pages=[pagina - 1])
+            buf = io.BytesIO()
+            dst.save(buf)
+            return buf.getvalue()
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
+def localizar_pagina_por_item(pages, numero_item):
+    """Primeira página (1-based) que cita este numero_item como referência
+    isolada (ex: "5.4") — usado pra ancorar o link de evidência na página
+    certa. Heurística por regex (como `REGEX_SEI_REFERENCIADO`), não NLP:
+    funciona porque o prompt já instrui a IA a extrair numero_item EXATAMENTE
+    como aparece no texto do próprio documento. Devolve None se não achar
+    (documento pode não repetir a numeração formal em lugar nenhum, ou o item
+    veio de recasamento por assunto em vez do texto do próprio doc)."""
+    if not numero_item:
+        return None
+    padrao = re.compile(r"(?<!\d)" + re.escape(numero_item) + r"(?!\d)")
+    for i, texto_pagina in enumerate(pages, start=1):
+        if padrao.search(texto_pagina or ""):
+            return i
+    return None
+
+
+def build_mapa_paginas(pages, result):
+    """{numero_item: pagina} pra toda não conformidade/resposta do resultado
+    já extraído pela IA, localizando onde cada item é citado no texto do
+    próprio documento — computado uma vez por documento e reaproveitado pra
+    ancorar o link de cada evidência (inclusive depois, via fila de
+    pendências ou aplicação de lote, sem precisar reabrir o PDF)."""
+    mapa = {}
+    itens = [nc.get("numero_item") for nc in (result.get("nao_conformidades") or [])]
+    itens += [r.get("numero_item") for r in (result.get("respostas") or [])]
+    for numero_item in itens:
+        if numero_item and numero_item not in mapa:
+            pagina = localizar_pagina_por_item(pages, numero_item)
+            if pagina:
+                mapa[numero_item] = pagina
+    return mapa
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +322,18 @@ def doc_id_from_filename(filename):
     return base.rsplit(".", 1)[0].strip()
 
 
+def chave_ordenacao_arquivo(nome_arquivo):
+    """Chave de ordenação numérica crescente pelo nome do arquivo — o nome é
+    geralmente o número do documento no SEI, que cresce cronologicamente.
+    Processar um lote nessa ordem ajuda um documento que cita/depende de
+    outro do MESMO lote (ex: Parecer que cita o DF) resolver de primeira no
+    processamento síncrono, sem precisar da fila de pendências. Cai pro nome
+    como string se não for puramente numérico (defensivo — nem todo arquivo
+    segue o padrão), sempre depois dos numéricos."""
+    base = doc_id_from_filename(nome_arquivo)
+    return (0, int(base)) if base.isdigit() else (1, base)
+
+
 def classify_catalog_entry(entry):
     """Decide o que fazer com o arquivo ANTES de gastar tokens.
 
@@ -305,12 +377,14 @@ Formato exato:
 Preencha "auditoria" (objeto com codigo_auditoria_anp, ordem_servico, operadora, cnpj_operadora,
 unidade_instalacao, tipo_auditoria, sumario_auditoria, acao_demandada, data_auditoria_inicio,
 data_auditoria_fim, data_emissao_relatorio, auditor_responsavel, auditores_equipe, status_auditoria,
-resultado_final) SOMENTE se tipo_documento for auditoria_oficial. O anexo técnico de uma auditoria
-também conta como auditoria_oficial.
+resultado_final, praticas_auditadas, documentos_solicitados, fonte_auditoria) SOMENTE se
+tipo_documento for auditoria_oficial. O anexo técnico de uma auditoria também conta como
+auditoria_oficial.
 
 Preencha "nao_conformidades" (array de {{numero_item, descricao, categoria_nao_conformidade,
-norma_referencia, classificacao_gravidade, acao_recomendada, prazo_correcao, evidencias}}) SOMENTE
-se tipo_documento for auditoria_oficial E o próprio documento for o Documento de Fiscalização (DF)
+norma_referencia, classificacao_gravidade, acao_recomendada, prazo_correcao, severidade,
+frequencia, elemento_critico, evidencias}}) SOMENTE se tipo_documento for auditoria_oficial E o
+próprio documento for o Documento de Fiscalização (DF)
 em si. Ordem de Serviço, Plano de Auditoria e Relatório de Auditoria também são auditoria_oficial,
 mas NÃO são o DF — preencha "auditoria" normalmente para eles, e deixe "nao_conformidades" como
 array vazio [], mesmo que o texto mencione problemas encontrados. Se houver dúvida sobre qual
@@ -330,6 +404,17 @@ Detalhe de cada campo novo de "auditoria":
   citados ou se só um auditor for mencionado.
 - resultado_final: a conclusão/status final da auditoria SE o documento deixar isso claro (ex:
   "interditada", "liberada para operação"); use null se não houver essa informação.
+- praticas_auditadas: as práticas/temas de segurança operacional que a auditoria teve como objetivo
+  verificar (ex: "Gestão de mudanças", "Investigação de incidentes", "Integridade mecânica",
+  "Gerenciamento de risco de processo"), concatenadas separadas por "; ". null se o documento não
+  detalhar isso (ex: um Ofício curto, sem escopo descrito).
+- documentos_solicitados: documentos que a ANP solicitou/exigiu que a operadora apresentasse ou
+  comprovasse (ex: "Procedimento de partida e parada", "Registros de treinamento da equipe",
+  "Certificados de inspeção de válvulas de alívio"), concatenados separados por "; ". null se o
+  documento não listar isso.
+- fonte_auditoria: o órgão que originou/conduziu a auditoria — normalmente "ANP", mas pode ser
+  "Marinha" (Autoridade Marítima/Marinha do Brasil) ou outro órgão explicitamente citado como
+  responsável pela fiscalização. Use "ANP" como padrão se o texto não indicar outro órgão claramente.
 
 Detalhe de cada campo novo de "nao_conformidades":
 - categoria_nao_conformidade: área temática do item (ex: "Gestão de risco", "Sistema de drenagem",
@@ -337,6 +422,18 @@ Detalhe de cada campo novo de "nao_conformidades":
 - acao_recomendada: a ação que a ANP exige da operadora para sanar especificamente este item,
   em até 20 palavras (geralmente o próprio texto da notificação, ex: "Refazer o estudo de
   dispersão de gases considerando condição de calmaria").
+- severidade: classificação de severidade/impacto do risco associado a este item, SE o documento
+  usar ou citar uma matriz/classificação de risco explícita (ex: "Catastrófica", "Crítica",
+  "Moderada", "Leve"). Diferente de classificacao_gravidade (a classificação geral do achado) —
+  severidade é especificamente o eixo de IMPACTO de uma matriz de risco. null se o documento não
+  classificar isso.
+- frequencia: classificação de frequência/probabilidade de ocorrência do risco associado a este
+  item, SE o documento usar ou citar uma matriz/classificação de risco explícita (ex: "Frequente",
+  "Provável", "Ocasional", "Remota", "Improvável"). null se o documento não classificar isso.
+- elemento_critico: o Elemento Crítico de Segurança Operacional (ECS/barreira de segurança)
+  relacionado a este item, quando o documento identificar (ex: "Sistema de detecção de gás",
+  "Válvula de alívio de pressão", "Sistema de combate a incêndio", "Sistema de parada de emergência
+  (ESD)"). null se não identificado.
 - evidencias: ver seção "EVIDÊNCIAS" abaixo — evidências que fundamentam ESTA não conformidade
   específica (ex: registro fotográfico, laudo técnico, relatório citado como base do achado).
 
@@ -361,9 +458,10 @@ não encontrar) — não confundir com a data da não conformidade original.
 {dica_ncs_existentes}
 
 EVIDÊNCIAS — tanto em "nao_conformidades" quanto em "respostas", cada não conformidade normalmente
-tem VÁRIAS evidências. "evidencias" é um array de {{descricao, apresentado_por}} — capture TODAS as
-evidências distintas relacionadas àquele item específico (use array vazio [] se não houver nenhuma
-pra esse item — nunca invente uma evidência que não esteja no texto):
+tem VÁRIAS evidências. "evidencias" é um array de {{descricao, apresentado_por, sistema_evidencia,
+equipamento_evidencia, categoria_evidencia, descritivo_imagens}} — capture TODAS as evidências
+distintas relacionadas àquele item específico (use array vazio [] se não houver nenhuma pra esse
+item — nunca invente uma evidência que não esteja no texto):
 - descricao: PRIORIZE o dado concreto e específico já descrito no próprio texto — medições, datas de
   ocorrências, quantidades, resultados de teste, contagens, fotos/registros mencionados — em vez de um
   resumo genérico. Exemplos de BOA descricao: "9 vazamentos de gás detectados desde 2022, incluindo 1
@@ -379,6 +477,16 @@ pra esse item — nunca invente uma evidência que não esteja no texto):
   da operadora, anexos técnicos enviados por ela em resposta a uma notificação); "anp" se foi a
   própria ANP quem produziu/observou a evidência (ex: registro da fiscalização, laudo do auditor,
   parecer técnico anterior). Use null só se o texto não deixar claro quem apresentou.
+- sistema_evidencia: o sistema operacional/de segurança ao qual esta evidência se refere (ex:
+  "Sistema de drenagem", "Sistema de detecção e combate a incêndio", "Sistema elétrico", "Sistema
+  de içamento"). null se não identificável no texto.
+- equipamento_evidencia: o equipamento específico citado nesta evidência, se houver (ex: "Bomba de
+  incêndio P-101", "Válvula PSV-204", "Detector de gás GD-12"). null se não identificável.
+- categoria_evidencia: a natureza/tipo desta evidência (ex: "Registro fotográfico", "Laudo
+  técnico", "Relatório de teste", "Documento", "Depoimento", "Medição"), em 1-3 palavras.
+- descritivo_imagens: SE esta evidência envolver foto(s)/imagem(ns)/registro(s) visual(is) citados
+  no texto, descreva o que a imagem mostra (ex: "Foto mostra corrosão acentuada na base do tanque,
+  com placa de identificação visível"). null se a evidência não envolver imagem.
 - Cuidado para não misturar evidências de itens diferentes: associe cada evidência apenas ao
   numero_item que o próprio texto vincula a ela, não à lista inteira de referências do documento.
 
@@ -465,27 +573,78 @@ def build_rematch_prompt(resposta, nao_conformidades_existentes):
 
 
 # ---------------------------------------------------------------------------
-# Prompt de "evidência de anexo" — usado quando um Documento de Fiscalização
-# cita um anexo específico como fonte de mais detalhe pra uma não
-# conformidade (ex: "os demais exemplos estão no anexo (SEI 4730233)"). Bem
-# mais barato que o prompt principal: não reclassifica o documento, só
-# extrai evidências relacionadas ao contexto já conhecido da NC.
+# Filtro local (Python, sem IA) de relevância de Anexo — decide CONTRA QUAIS
+# não conformidades já cadastradas do processo um Anexo é candidato a ter
+# relação, comparando vocabulário que já existe no banco pra cada NC com o
+# texto do anexo. Só as NCs que baterem entram no prompt da IA; se nenhuma
+# bater, a IA nem é chamada (decisão determinística, sem custo de token).
+# ---------------------------------------------------------------------------
+# Siglas/códigos técnicos (ex: "ESDV", "HAZOP", "QRA", "PSV-204", "CO2") —
+# deliberadamente não usa lista de stopwords: só considera token específico
+# em maiúsculas, nunca palavra genérica ("SISTEMA", "CONSIDERANDO" etc. não
+# aparecem assim no texto corrido, então não geram falso positivo). Sem \b no
+# final: extrai só o prefixo maiúsculo mesmo quando seguido de sufixo minúsculo
+# (ex: "ESDVs" no plural, "HAZOPs") — o \b inicial já garante que o termo
+# começa em borda de palavra.
+REGEX_TERMO_TECNICO = re.compile(r"\b[A-ZÀ-Ú]{2,}[A-ZÀ-Ú0-9-]*")
+
+
+def _termos_tecnicos(texto):
+    return {t.upper() for t in REGEX_TERMO_TECNICO.findall(texto or "")}
+
+
+def anexo_relevante_para_nc(texto_anexo, nc):
+    """True se o anexo é candidato a ter relação com esta NC, por vocabulário
+    já conhecido dela: frase de categoria_nao_conformidade ou elemento_critico
+    aparecendo no texto do anexo, OU overlap de termos técnicos (siglas/
+    códigos) entre a descricao da NC e o texto do anexo."""
+    texto_lower = (texto_anexo or "").lower()
+    for campo in (nc.get("categoria_nao_conformidade"), nc.get("elemento_critico")):
+        if campo and campo.strip().lower() in texto_lower:
+            return True
+    termos_nc = _termos_tecnicos(nc.get("descricao") or "")
+    if termos_nc and termos_nc & _termos_tecnicos(texto_anexo):
+        return True
+    return False
+
+
+def filtrar_ncs_relevantes(texto_anexo, ncs):
+    """Subconjunto de `ncs` (cada uma {numero_item, descricao,
+    categoria_nao_conformidade, elemento_critico}, formato de
+    `db.fetch_ncs_resumo`) que passa no filtro local de relevância — só essas
+    entram no prompt da IA."""
+    return [nc for nc in ncs if anexo_relevante_para_nc(texto_anexo, nc)]
+
+
+# ---------------------------------------------------------------------------
+# Prompt de "evidência de anexo" — usado pra ler um Anexo do processo contra
+# UMA não conformidade candidata por vez (ver `filtrar_ncs_relevantes`), nunca
+# a lista inteira numa chamada só. Um anexo grande com evidência pra várias
+# NCs de uma vez gera uma resposta grande o bastante pra estourar max_tokens
+# e voltar JSON truncado/inválido (já aconteceu — ver histórico de
+# max_tokens em `_call_claude`); uma chamada pequena por NC candidata mantém
+# cada resposta sempre dentro do limite — Anexo é raro no catálogo, e o
+# filtro Python já reduz bastante quantas NCs viram chamada, então mais
+# chamadas pequenas ainda sai barato.
 # ---------------------------------------------------------------------------
 PROMPT_ANEXO_EVIDENCIA = """Você organiza auditorias de segurança operacional da ANP (petróleo e gás, Brasil).
 
-O Documento de Fiscalização deste processo citou o anexo abaixo como fonte de MAIS DETALHE para a
-seguinte não conformidade:
+Este documento é um Anexo do processo, pré-selecionado (por vocabulário técnico em comum) como
+CANDIDATO a sustentar a seguinte não conformidade já cadastrada:
 
-Não conformidade: {contexto_nc}
+Não conformidade {numero_item}: {descricao_nc}
 
 Analise o texto do anexo e responda SOMENTE com JSON válido, sem markdown, no formato exato:
-{{"evidencias": [{{"descricao": "string", "apresentado_por": "anp|operadora|null"}}]}}
+{{"evidencias": [{{"descricao": "string", "apresentado_por": "anp|operadora|null",
+"sistema_evidencia": "string ou null", "equipamento_evidencia": "string ou null",
+"categoria_evidencia": "string ou null", "descritivo_imagens": "string ou null"}}]}}
 
-Extraia TODAS as evidências específicas (observações, medições, datas, ocorrências, fotos
-mencionadas) descritas neste anexo que sustentem essa não conformidade — uma entrada por evidência
-distinta, priorizando o dado concreto (ex: "Vazamento ativo em linha de offloading, identificado em
-[data/local]" em vez de um resumo genérico). Use array vazio [] se o anexo não tiver relação com a
-não conformidade. Nunca invente uma evidência que não esteja no texto do anexo.
+Confirme pelo conteúdo REAL do texto (não assuma só porque foi pré-selecionado) se este anexo
+sustenta essa não conformidade específica. Se sim, extraia TODAS as evidências distintas
+(observações, medições, datas, quantidades, resultados de teste, fotos mencionadas) — priorize
+dado concreto sobre resumo genérico, mesmos critérios do prompt principal. Se o anexo não tiver
+relação real com esta não conformidade, responda {{"evidencias": []}}. Nunca invente uma evidência
+que não esteja no texto do anexo.
 
 TEXTO DO ANEXO (pode estar truncado):
 ---
@@ -494,5 +653,9 @@ TEXTO DO ANEXO (pode estar truncado):
 """
 
 
-def build_anexo_evidencia_prompt(contexto_nc, texto_anexo):
-    return PROMPT_ANEXO_EVIDENCIA.format(contexto_nc=contexto_nc or "(sem descrição)", texto=texto_anexo)
+def build_anexo_evidencia_prompt(nc, texto_anexo):
+    return PROMPT_ANEXO_EVIDENCIA.format(
+        numero_item=nc.get("numero_item"),
+        descricao_nc=nc.get("descricao") or "(sem descrição)",
+        texto=texto_anexo,
+    )

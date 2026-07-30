@@ -33,7 +33,6 @@ import pipeline
 from pipeline import (
     extract_processo_regex,
     normalize_processo,
-    extract_text as _pipeline_extract_text,
     doc_id_from_filename,
     classify_catalog_entry,
     load_catalog,
@@ -94,8 +93,14 @@ CONFIDENCE_THRESHOLD = 0.7
 MAX_CHARS = OLLAMA_MAX_CHARS if LLM_PROVIDER == "ollama" else CLAUDE_MAX_CHARS
 CURRENT_MODEL_LABEL = f"ollama:{OLLAMA_MODEL}" if LLM_PROVIDER == "ollama" else f"claude:{ANTHROPIC_MODEL}"
 
-def extract_text(file_bytes, max_chars=None):
-    return _pipeline_extract_text(file_bytes, max_chars or MAX_CHARS)
+# Limite maior que o padrão (8000/4096) só pro prompt de evidência de anexo —
+# uma NC "guarda-chuva" (ex: "gestão de risco") pode puxar evidência de um
+# anexo grande o bastante pra estourar o padrão numa chamada de UMA NC só.
+# Confirmado em produção (stop_reason="max_tokens" no teste que reproduziu o
+# JSONDecodeError) que 16000/8192 é suficiente pro pior caso observado até
+# agora, com folga.
+ANEXO_CLAUDE_MAX_TOKENS = 16000
+ANEXO_OLLAMA_NUM_PREDICT = 8192
 
 
 # ---------------------------------------------------------------------------
@@ -113,19 +118,24 @@ def _clean_json_text(raw):
     return raw
 
 
-def _call_claude(prompt):
+def _call_claude(prompt, max_tokens=8000):
     msg = _claude_client.messages.create(
         model=ANTHROPIC_MODEL,
         # Documentos de auditoria reais costumam ter 10-40+ não conformidades,
         # cada uma com vários campos — 2000 tokens cortava o JSON no meio e
         # quebrava com JSONDecodeError antes mesmo de salvar qualquer coisa.
-        max_tokens=8000,
+        # "max_tokens" é parametrizável porque a mesma falha reapareceu no
+        # prompt de evidência de anexo: uma NC "guarda-chuva" (ex: "gestão de
+        # risco") pode puxar evidência de um anexo grande o bastante pra
+        # estourar 8000 mesmo numa chamada de UMA NC só (stop_reason=
+        # "max_tokens" confirmado em produção) — ver `_extrair_evidencias_anexo`.
+        max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}],
     )
     return "".join(b.text for b in msg.content if b.type == "text")
 
 
-def _call_ollama(prompt):
+def _call_ollama(prompt, num_predict=None):
     import requests
     resp = requests.post(
         f"{OLLAMA_HOST}/api/generate",
@@ -135,7 +145,7 @@ def _call_ollama(prompt):
             "stream": False,
             "format": "json",
             "think": OLLAMA_THINK,
-            "options": {"temperature": 0, "num_ctx": OLLAMA_NUM_CTX, "num_predict": OLLAMA_NUM_PREDICT},
+            "options": {"temperature": 0, "num_ctx": OLLAMA_NUM_CTX, "num_predict": num_predict or OLLAMA_NUM_PREDICT},
         },
         timeout=300,
     )
@@ -178,7 +188,7 @@ def match_resposta_to_nc(r, ncs):
 # ---------------------------------------------------------------------------
 # Lógica de vínculo — reutilizada tanto no upload quanto na fila de retentativa
 # ---------------------------------------------------------------------------
-def apply_auditoria(result, filename, is_df=False, link_arquivo=None):
+def apply_auditoria(result, filename, is_df=False, link_arquivo=None, links_por_item=None):
     """auditoria_oficial sempre "resolve" na hora: cria ou atualiza.
 
     Não conformidades só são gravadas quando "is_df" — o documento é o
@@ -187,6 +197,12 @@ def apply_auditoria(result, filename, is_df=False, link_arquivo=None):
     mas nunca devem gerar linha em tb_nao_conformidades: essa é
     exclusivamente do DF (ou de vários DFs, se o processo tiver mais de um —
     todos contribuem, upsert_nc já mescla por numero_item).
+
+    "link_arquivo" é o PDF completo deste arquivo (fallback) e
+    "links_por_item" (opcional) é {numero_item: link do recorte de 1 página}
+    já resolvido por `_build_links_por_item` — cada NC usa o recorte da
+    página onde seu próprio numero_item foi citado, quando conhecido, senão
+    cai no PDF completo.
     """
     aud = {k: v for k, v in {
         "numero_processo_anp": result.get("numero_processo_anp"),
@@ -196,8 +212,10 @@ def apply_auditoria(result, filename, is_df=False, link_arquivo=None):
     id_auditoria = db.upsert_auditoria(sb, aud, filename)
     n = 0
     if is_df:
+        links_por_item = links_por_item or {}
         for nc in result.get("nao_conformidades", []):
-            db.upsert_nc(sb, id_auditoria, nc, filename, link_arquivo=link_arquivo)
+            link_nc = links_por_item.get(nc.get("numero_item"), link_arquivo)
+            db.upsert_nc(sb, id_auditoria, nc, filename, link_arquivo=link_nc)
         n = len(result.get("nao_conformidades", []))
         # Quando há mais de um DF no mesmo processo, o mais informativo (mais
         # não conformidades + mais campos de auditoria preenchidos) deve ficar
@@ -207,16 +225,24 @@ def apply_auditoria(result, filename, is_df=False, link_arquivo=None):
     return id_auditoria, n
 
 
-def try_apply_respostas(numero_processo_anp, numero_relatorio, respostas, tipo, filename, link_arquivo=None):
+def try_apply_respostas(numero_processo_anp, numero_relatorio, respostas, tipo, filename, link_arquivo=None, links_por_item=None):
     """Tenta vincular cada resposta a uma não conformidade existente.
 
     Retorna (status, itens_nao_resolvidos, mensagem).
     status: 'concluido' | 'parcial' | 'pendente_vinculo'
+
+    "link_arquivo" é o PDF completo deste arquivo (fallback) e
+    "links_por_item" (opcional) é {numero_item: link do recorte de 1 página}
+    já resolvido por `_build_links_por_item` — usa o numero_item ORIGINAL da
+    resposta (como extraído deste documento), mesmo quando ela é recasada
+    pra outra NC por assunto — é sobre onde este documento cita seu próprio
+    item, não sobre o id da NC de destino.
     """
     aud = db.find_auditoria(sb, numero_processo_anp, numero_relatorio)
     if not aud:
         return "pendente_vinculo", respostas, "auditoria ainda não cadastrada"
 
+    links_por_item = links_por_item or {}
     resolvidos, pendentes = 0, []
     ncs_cache = None
     for r in respostas:
@@ -235,7 +261,8 @@ def try_apply_respostas(numero_processo_anp, numero_relatorio, respostas, tipo, 
         if not nc:
             pendentes.append(r)
             continue
-        db.insert_resposta(sb, nc["id_nao_conformidade"], aud["id_auditoria"], tipo, r, filename, link_arquivo=link_arquivo)
+        link_r = links_por_item.get(r.get("numero_item"), link_arquivo)
+        db.insert_resposta(sb, nc["id_nao_conformidade"], aud["id_auditoria"], tipo, r, filename, link_arquivo=link_r)
         resolvidos += 1
 
     if not pendentes:
@@ -250,6 +277,13 @@ def retry_pending_queue():
     resolvidos = []
     for item in db.fetch_pendentes(sb):
         payload = item["payload_json"] or {}
+
+        if payload.get("tipo_documento") == "anexo_evidencia":
+            motivo = _retry_anexo_pendente(item, payload)
+            if motivo:
+                resolvidos.append(item["nome_arquivo"])
+            continue
+
         status, pendentes, msg = try_apply_respostas(
             payload.get("numero_processo_anp"),
             payload.get("numero_relatorio"),
@@ -257,6 +291,7 @@ def retry_pending_queue():
             payload.get("tipo_documento"),
             item["nome_arquivo"],
             link_arquivo=payload.get("link_arquivo"),
+            links_por_item=payload.get("links_por_item"),
         )
         if status != item["status"] or len(pendentes) != len(payload.get("respostas", [])):
             novo_payload = {**payload, "respostas": pendentes} if pendentes else None
@@ -272,8 +307,25 @@ def retry_pending_queue():
 # ---------------------------------------------------------------------------
 # Processamento de um upload
 # ---------------------------------------------------------------------------
+def _build_links_por_item(file_bytes, file_hash, mapa_paginas):
+    """Recorta e sobe 1 PDF de página (ver `pipeline.build_page_pdf`) pra
+    cada numero_item cuja página foi localizada em `mapa_paginas` — vira o
+    link de evidência daquele item específico. Falha ao recortar/subir uma
+    página não derruba as demais (best-effort — quem chama já cai no PDF
+    completo como fallback pra esse item se ele não aparecer no dict)."""
+    links = {}
+    for numero_item, pagina in mapa_paginas.items():
+        try:
+            pagina_bytes = pipeline.build_page_pdf(file_bytes, pagina)
+            links[numero_item] = db.upload_evidencia_pagina(sb, pagina_bytes, file_hash, pagina)
+        except Exception:
+            continue
+    return links
+
+
 def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, numero_override=None, is_df=False,
-                     numero_sei=None, numero_processo_divergente=None, link_arquivo=None):
+                     numero_sei=None, numero_processo_divergente=None, link_arquivo=None,
+                     file_bytes=None, pages=None):
     """Aplica overrides determinísticos, o gate de confiança e grava o resultado.
 
     Compartilhado entre o processamento síncrono (upload direto, 1 chamada de
@@ -281,8 +333,18 @@ def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, nume
     lote da Batch API — a única diferença entre os três fluxos é como
     "result" (JSON já classificado pela IA) chegou até aqui; a partir daqui a
     lógica de vínculo é idêntica pros três.
+
+    "pages" (texto por página, quando disponível) monta "mapa_paginas"
+    ({numero_item: pagina}, ver `pipeline.build_mapa_paginas`); "file_bytes"
+    (os bytes do PDF original) é usado junto disso pra recortar e subir 1 PDF
+    de página por item via `_build_links_por_item` — os links de evidência já
+    saem apontando pro recorte certo, sem precisar reabrir o PDF depois (fila
+    de pendências e aplicação de lote guardam só os links já resolvidos, não
+    as páginas nem os bytes).
     """
     tipo = result["tipo_documento"]
+    mapa_paginas = pipeline.build_mapa_paginas(pages, result) if pages else {}
+    links_por_item = _build_links_por_item(file_bytes, file_hash, mapa_paginas) if file_bytes and mapa_paginas else {}
 
     # Override determinístico: o catálogo do SEI já classificou este documento
     # como Documento de Fiscalização (ou peça oficial equivalente) — não
@@ -304,14 +366,14 @@ def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, nume
     )
 
     if decisao_catalogo != "prioritario" and (result["confianca"] < CONFIDENCE_THRESHOLD or tipo in ("indeterminado", "evidencia_anexa")):
-        db.upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo, result["confianca"], "revisao_manual", "confiança baixa ou tipo não processável automaticamente", **rastreio)
+        db.upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo, result["confianca"], "revisao_manual", "confiança baixa ou tipo não processável automaticamente", link_arquivo=link_arquivo, **rastreio)
         return "revisao", f"confiança {result['confianca']:.2f} — tipo {tipo}"
 
     processo_label = f" [processo {result.get('numero_processo_anp') or '—'}]"
 
     if tipo == "auditoria_oficial":
-        id_auditoria, n = apply_auditoria(result, nome_arquivo, is_df=is_df, link_arquivo=link_arquivo)
-        db.upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo, result["confianca"], "concluido", f"auditoria {id_auditoria}", **rastreio)
+        id_auditoria, n = apply_auditoria(result, nome_arquivo, is_df=is_df, link_arquivo=link_arquivo, links_por_item=links_por_item)
+        db.upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo, result["confianca"], "concluido", f"auditoria {id_auditoria}", link_arquivo=link_arquivo, **rastreio)
         resolvidos = retry_pending_queue()
         detalhe = f"auditoria {id_auditoria} atualizada com {n} não conformidade(s){processo_label}"
         if resolvidos:
@@ -321,7 +383,7 @@ def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, nume
     # resposta_operadora ou parecer_anp
     status, pendentes, msg = try_apply_respostas(
         result.get("numero_processo_anp"), result.get("numero_relatorio"),
-        result.get("respostas", []), tipo, nome_arquivo, link_arquivo=link_arquivo,
+        result.get("respostas", []), tipo, nome_arquivo, link_arquivo=link_arquivo, links_por_item=links_por_item,
     )
     msg += processo_label
     # Salva o payload sempre que NÃO resolveu de vez (mesmo se "pendentes"
@@ -338,52 +400,156 @@ def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, nume
             "numero_relatorio": result.get("numero_relatorio"),
             "respostas": pendentes,
             "link_arquivo": link_arquivo,
+            "links_por_item": links_por_item,
         }
-    db.upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo, result["confianca"], status, msg, payload, **rastreio)
+    db.upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo, result["confianca"], status, msg, payload, link_arquivo=link_arquivo, **rastreio)
     status_label = {"concluido": "concluido", "parcial": "revisao", "pendente_vinculo": "revisao"}[status]
     return status_label, msg
 
 
-def _try_processar_anexo_referenciado(file_bytes, file_hash, nome_arquivo, doc_id, numero_catalogo):
+def _extrair_evidencias_anexo(texto_anexo, ncs_candidatas, id_auditoria, nome_arquivo, link_arquivo):
+    """Chama a IA UMA VEZ POR NC candidata (nunca a lista inteira numa
+    chamada só — resposta grande o bastante estoura max_tokens e volta JSON
+    truncado, ver `pipeline.PROMPT_ANEXO_EVIDENCIA`). Cada chamada é isolada
+    em try/except: uma falha numa NC não derruba as demais candidatas do
+    mesmo anexo. Devolve (total_evidencias, ncs_atingidas, falhas, erros) —
+    "erros" guarda a mensagem real de cada falha (não só a contagem), pra dar
+    pra diagnosticar direto pelo "motivo" salvo no banco sem precisar
+    reproduzir a chamada manualmente."""
+    total_evidencias, ncs_atingidas, falhas, erros = 0, 0, 0, []
+    for nc_cand in ncs_candidatas:
+        try:
+            prompt = pipeline.build_anexo_evidencia_prompt(nc_cand, texto_anexo)
+            raw = (
+                _call_ollama(prompt, num_predict=ANEXO_OLLAMA_NUM_PREDICT) if LLM_PROVIDER == "ollama"
+                else _call_claude(prompt, max_tokens=ANEXO_CLAUDE_MAX_TOKENS)
+            )
+            evidencias = json.loads(_clean_json_text(raw)).get("evidencias", [])
+        except Exception as e:
+            falhas += 1
+            erros.append(f"{nc_cand.get('numero_item')}: {type(e).__name__}: {e}")
+            continue
+        if not evidencias:
+            continue
+        nc = db.find_nc(sb, id_auditoria, nc_cand.get("numero_item"))
+        if not nc:
+            continue
+        db.insert_evidencias(sb, evidencias, nome_arquivo, id_nao_conformidade=nc["id_nao_conformidade"], link_arquivo=link_arquivo)
+        total_evidencias += len(evidencias)
+        ncs_atingidas += 1
+    return total_evidencias, ncs_atingidas, falhas, erros
+
+
+def _try_processar_anexo(file_bytes, file_hash, nome_arquivo, doc_id, numero_catalogo):
     """Só chamada para tipo 'Anexo' (nunca E-mail/Recibo/outros descartados).
 
-    Se algum DF já citou este número SEI como fonte de mais detalhe de uma
-    não conformidade (`fetch_evidencias_por_anexo`), lê o anexo, extrai
-    evidências específicas com um prompt pequeno (sem reclassificar o
-    documento) e grava com o link do PRÓPRIO anexo — não o do DF. Sem
-    citação pendente, devolve None e o chamador descarta normalmente.
+    Sem processo conhecido, devolve None e o chamador descarta normalmente
+    (não dá pra comparar contra não conformidade nenhuma). Com processo
+    conhecido mas SEM auditoria/NC cadastrada ainda, fica pendente — resolvido
+    depois por `retry_pending_queue` quando o DF for processado (mesma leva
+    ou não). Com NCs já cadastradas, filtra localmente em Python
+    (`pipeline.filtrar_ncs_relevantes`) quais são candidatas por vocabulário
+    antes de gastar qualquer token — só chama a IA se alguma bater.
     """
-    ncs_esperando = db.fetch_evidencias_por_anexo(sb, doc_id)
-    if not ncs_esperando:
+    if not numero_catalogo:
         return None
 
-    texto_anexo = extract_text(file_bytes)
+    aud = db.find_auditoria(sb, numero_processo_anp=numero_catalogo)
+    ncs = db.fetch_ncs_resumo(sb, aud["id_auditoria"]) if aud else []
+
+    pages = pipeline.extract_pages(file_bytes)
+    texto_anexo = "\n".join(pages)[:MAX_CHARS]
     if not texto_anexo.strip():
         return None
 
-    contexto_por_nc = {}
-    for row in ncs_esperando:
-        contexto_por_nc.setdefault(row["id_nao_conformidade"], []).append(row.get("descricao"))
-
     link_anexo = db.upload_evidencia_arquivo(sb, file_bytes, file_hash, nome_arquivo)
-    total_evidencias = 0
-    for id_nc, descricoes in contexto_por_nc.items():
-        contexto_nc = " | ".join(d for d in descricoes if d)
-        prompt = pipeline.build_anexo_evidencia_prompt(contexto_nc, texto_anexo)
-        try:
-            raw = _call_ollama(prompt) if LLM_PROVIDER == "ollama" else _call_claude(prompt)
-            evidencias = json.loads(_clean_json_text(raw)).get("evidencias", [])
-        except Exception:
-            continue
-        db.insert_evidencias(sb, evidencias, nome_arquivo, id_nao_conformidade=id_nc, link_arquivo=link_anexo)
-        total_evidencias += len(evidencias)
 
-    motivo = f"anexo referenciado pelo DF — {total_evidencias} evidência(s) extraída(s) para {len(contexto_por_nc)} não conformidade(s)"
+    if not ncs:
+        db.upsert_arquivo_status(
+            sb, file_hash, nome_arquivo, "Anexo", 1.0, "pendente_vinculo",
+            "anexo aguardando não conformidades do processo serem cadastradas",
+            payload_json={"tipo_documento": "anexo_evidencia", "numero_processo_anp": numero_catalogo},
+            numero_sei=doc_id, numero_processo_anp=numero_catalogo,
+            link_arquivo=link_anexo,
+        )
+        return "revisao", "anexo pendente — processo ainda sem não conformidades cadastradas"
+
+    candidatas = pipeline.filtrar_ncs_relevantes(texto_anexo, ncs)
+    if not candidatas:
+        motivo = "sem correspondência de vocabulário com as não conformidades do processo — IA não foi chamada"
+        db.upsert_arquivo_status(
+            sb, file_hash, nome_arquivo, "Anexo", 1.0, "concluido", motivo,
+            numero_sei=doc_id, numero_processo_anp=numero_catalogo, link_arquivo=link_anexo,
+        )
+        return "concluido", motivo
+
+    total_evidencias, ncs_atingidas, falhas, erros = _extrair_evidencias_anexo(texto_anexo, candidatas, aud["id_auditoria"], nome_arquivo, link_anexo)
+
+    # "erro" só se TODAS as candidatas falharam na chamada de IA — falha
+    # parcial (algumas OK, outras não) ainda é "concluido", com a contagem de
+    # falhas e o erro real (não só a contagem) visível no motivo.
+    status = "erro" if falhas and falhas == len(candidatas) else "concluido"
+    motivo = (
+        f"anexo analisado ({len(candidatas)} NC candidata(s) por vocabulário) — "
+        f"{total_evidencias} evidência(s) confirmada(s) para {ncs_atingidas} não conformidade(s)"
+        + (f" — {falhas} chamada(s) de IA falharam: {'; '.join(erros)}" if falhas else "")
+    )
     db.upsert_arquivo_status(
-        sb, file_hash, nome_arquivo, "Anexo", 1.0, "concluido", motivo,
+        sb, file_hash, nome_arquivo, "Anexo", 1.0 if status == "concluido" else 0.0, status, motivo,
         numero_sei=doc_id, numero_processo_anp=numero_catalogo, link_arquivo=link_anexo,
     )
-    return "concluido", motivo
+    return status, motivo
+
+
+def _retry_anexo_pendente(item, payload):
+    """Reaplica `_try_processar_anexo` pra um Anexo que ficou pendente por
+    falta de NC cadastrada, agora que uma auditoria pode ter aparecido —
+    chamado por `retry_pending_queue`. Sem bytes do arquivo em memória
+    (a pendência pode ter horas/dias), baixa de novo do `link_arquivo` (PDF)
+    já salvo na própria linha — mesmo padrão usado em `apply_batch_result`
+    pra reconstruir páginas de um lote já finalizado.
+    """
+    numero_catalogo = payload.get("numero_processo_anp")
+    aud = db.find_auditoria(sb, numero_processo_anp=numero_catalogo)
+    if not aud:
+        return None
+    ncs = db.fetch_ncs_resumo(sb, aud["id_auditoria"])
+    if not ncs:
+        return None
+
+    if not item.get("link_arquivo"):
+        return None
+    try:
+        import requests
+        resp = requests.get(item["link_arquivo"], timeout=30)
+        resp.raise_for_status()
+        pages = pipeline.extract_pages(resp.content)
+    except Exception:
+        return None
+    texto_anexo = "\n".join(pages)[:MAX_CHARS]
+    if not texto_anexo.strip():
+        return None
+
+    link_anexo = item.get("link_arquivo")
+    candidatas = pipeline.filtrar_ncs_relevantes(texto_anexo, ncs)
+    if not candidatas:
+        motivo = "sem correspondência de vocabulário com as não conformidades do processo — IA não foi chamada"
+    else:
+        total_evidencias, ncs_atingidas, falhas, erros = _extrair_evidencias_anexo(texto_anexo, candidatas, aud["id_auditoria"], item["nome_arquivo"], link_anexo)
+        if falhas and falhas == len(candidatas):
+            return None  # todas as chamadas falharam — tenta de novo na próxima passada da fila
+        motivo = (
+            f"anexo (fila) analisado ({len(candidatas)} NC candidata(s) por vocabulário) — "
+            f"{total_evidencias} evidência(s) confirmada(s) para {ncs_atingidas} não conformidade(s)"
+            + (f" — {falhas} chamada(s) de IA falharam: {'; '.join(erros)}" if falhas else "")
+        )
+
+    db.upsert_arquivo_status(
+        sb, item["hash_arquivo"], item["nome_arquivo"], "Anexo", 1.0, "concluido", motivo,
+        numero_sei=item.get("numero_sei"), numero_processo_anp=numero_catalogo,
+        link_arquivo=link_anexo,
+    )
+    return motivo
 
 
 def process_one_file(file_bytes, nome_arquivo, catalogo=None, force=False, numero_pasta_fallback=None,
@@ -426,7 +592,7 @@ def process_one_file(file_bytes, nome_arquivo, catalogo=None, force=False, numer
 
     if decisao_catalogo == "descartar":
         if entry and pipeline.is_tipo_anexo(entry.get("tipo_documento")):
-            resultado_anexo = _try_processar_anexo_referenciado(file_bytes, file_hash, nome_arquivo, doc_id, numero_catalogo)
+            resultado_anexo = _try_processar_anexo(file_bytes, file_hash, nome_arquivo, doc_id, numero_catalogo)
             if resultado_anexo:
                 return resultado_anexo
         motivo = (
@@ -441,7 +607,8 @@ def process_one_file(file_bytes, nome_arquivo, catalogo=None, force=False, numer
         )
         return "descartado", motivo
 
-    texto = extract_text(file_bytes)
+    pages = pipeline.extract_pages(file_bytes)
+    texto = "\n".join(pages)[:MAX_CHARS]
     if not texto.strip():
         db.upsert_arquivo_status(
             sb, file_hash, nome_arquivo, None, 0.0, "erro", "sem texto extraível (pode precisar de OCR)",
@@ -483,6 +650,7 @@ def process_one_file(file_bytes, nome_arquivo, catalogo=None, force=False, numer
     return finalize_result(
         result, file_hash, nome_arquivo, decisao_catalogo, numero_override=numero_override, is_df=is_df,
         numero_sei=doc_id, numero_processo_divergente=numero_divergente, link_arquivo=link_arquivo,
+        file_bytes=file_bytes, pages=pages,
     )
 
 
@@ -511,7 +679,15 @@ def _iter_zip_pdfs(zip_bytes):
     """Percorre o ZIP inteiro, inclusive subpastas dentro da pasta de cada
     processo. O processo é identificado pelo PRIMEIRO segmento do caminho
     dentro do zip — não importa quantos níveis de subpasta o PDF esteja.
+
+    Devolve os arquivos de cada processo em ordem NUMÉRICA crescente pelo
+    nome (`pipeline.chave_ordenacao_arquivo` — o nome é o número do
+    documento no SEI, que cresce cronologicamente): processar nessa ordem
+    ajuda um documento que cita/depende de outro do MESMO lote (ex: Parecer
+    que cita o DF) resolver de primeira no processamento síncrono, sem
+    precisar da fila de pendências.
     """
+    entradas = []
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for info in zf.infolist():
             if info.is_dir():
@@ -523,7 +699,9 @@ def _iter_zip_pdfs(zip_bytes):
             if any(parte.startswith(".") or parte == "__MACOSX" for parte in caminho.parts):
                 continue
             pasta_processo = caminho.parts[0] if len(caminho.parts) > 1 else "sem_pasta"
-            yield pasta_processo, caminho.name, zf.read(info)
+            entradas.append((pasta_processo, caminho.name, zf.read(info)))
+    entradas.sort(key=lambda t: (t[0], pipeline.chave_ordenacao_arquivo(t[1])))
+    yield from entradas
 
 
 def prepare_batch_from_zip(zip_bytes, catalogo, force=False, processos_reprocessar=None):
@@ -557,7 +735,7 @@ def prepare_batch_from_zip(zip_bytes, catalogo, force=False, processos_reprocess
 
         if decisao == "descartar":
             if entry and pipeline.is_tipo_anexo(entry.get("tipo_documento")):
-                resultado_anexo = _try_processar_anexo_referenciado(file_bytes, file_hash, nome_arquivo, doc_id, numero_catalogo)
+                resultado_anexo = _try_processar_anexo(file_bytes, file_hash, nome_arquivo, doc_id, numero_catalogo)
                 if resultado_anexo:
                     # não passa pela Batch API — já foi lido e concluído aqui mesmo
                     contagem["anexo_lido"] = contagem.get("anexo_lido", 0) + 1
@@ -575,7 +753,8 @@ def prepare_batch_from_zip(zip_bytes, catalogo, force=False, processos_reprocess
             contagem["descartado"] += 1
             continue
 
-        texto = extract_text(file_bytes)
+        pages = pipeline.extract_pages(file_bytes)
+        texto = "\n".join(pages)[:MAX_CHARS]
         if not texto.strip():
             db.upsert_arquivo_status(
                 sb, file_hash, nome_arquivo, None, 0.0, "erro", "sem texto extraível (pode precisar de OCR)",
@@ -653,7 +832,7 @@ def process_zip_batch_sync(zip_bytes, catalogo, force=False, on_item=None, proce
     (pasta_processo, nome_arquivo, status, detalhe) — usado pra atualizar a
     UI item a item.
     """
-    itens = sorted(_iter_zip_pdfs(zip_bytes), key=lambda t: (t[0], t[1]))
+    itens = list(_iter_zip_pdfs(zip_bytes))  # já vem em ordem numérica crescente por processo
     contagem = {}
     for pasta_processo, nome_arquivo, file_bytes in itens:
         numero_pasta = pipeline.extract_processo_from_foldername(pasta_processo)
@@ -704,10 +883,26 @@ def apply_batch_result(item, result):
         )
         return "erro", motivo
 
+    # Recortar página por item exige o numero_item, que só existe agora — sem
+    # mais os bytes do PDF em memória (o lote pode ter levado horas), baixa
+    # de novo do link já salvo (best-effort: se falhar, segue sem recorte,
+    # `finalize_result` cai no PDF completo já linkado via `link_arquivo`).
+    file_bytes, pages = None, None
+    if item.get("link_arquivo"):
+        try:
+            import requests
+            resp = requests.get(item["link_arquivo"], timeout=30)
+            resp.raise_for_status()
+            file_bytes = resp.content
+            pages = pipeline.extract_pages(file_bytes)
+        except Exception:
+            file_bytes, pages = None, None
+
     return finalize_result(
         parsed, file_hash, nome_arquivo, decisao_catalogo, numero_override=numero_override,
         is_df=item.get("is_df", False), numero_sei=item.get("numero_sei"),
         numero_processo_divergente=item.get("numero_processo_divergente"), link_arquivo=item.get("link_arquivo"),
+        file_bytes=file_bytes, pages=pages,
     )
 
 

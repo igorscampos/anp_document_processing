@@ -20,6 +20,9 @@ create table if not exists tb_auditorias (
     auditores_equipe text,  -- demais integrantes da equipe (além do líder), concatenados com "; "
     status_auditoria text,
     resultado_final text,
+    praticas_auditadas text,      -- práticas/temas de segurança operacional que a auditoria teve como objetivo verificar, concatenados com "; "
+    documentos_solicitados text,  -- documentos que a ANP solicitou à operadora apresentar/comprovar, concatenados com "; "
+    fonte_auditoria text,         -- órgão que originou/conduziu a auditoria (ex: "ANP", "Marinha", "Outros")
     arquivo_origem text,
     arquivo_origem_score integer default 0,  -- "riqueza" do arquivo_origem atual (qtd de NCs + campos preenchidos) — só troca de DF de referência quando um novo tiver score maior
     criado_em timestamptz default now(),
@@ -36,6 +39,9 @@ create table if not exists tb_nao_conformidades (
     classificacao_gravidade text,
     acao_recomendada text,
     prazo_correcao text,
+    severidade text,        -- severidade/impacto do risco associado (matriz de risco), quando o documento classificar isso
+    frequencia text,        -- frequência/probabilidade de ocorrência do risco associado, quando o documento classificar isso
+    elemento_critico text,  -- Elemento Crítico de Segurança Operacional (ECS) relacionado a este item, quando identificado
     status_atual text,
     arquivo_origem text,
     criado_em timestamptz default now(),
@@ -70,7 +76,11 @@ create table if not exists tb_evidencias (
     apresentado_por text check (apresentado_por in ('anp', 'operadora')),
     descricao text,
     arquivo_referenciado text,  -- nº SEI citado dentro da própria descricao (regex), se houver
-    link_evidencia text,  -- URL pública do PDF de origem no Supabase Storage — do arquivo_referenciado quando já processado, senão do arquivo_origem
+    link_evidencia text,  -- URL pública de um PDF de 1 página recortado do documento original na página onde a evidência foi localizada (ou do PDF completo, quando a página não foi identificada) — do arquivo_referenciado quando já processado, senão do arquivo_origem
+    sistema_evidencia text,       -- sistema operacional/de segurança ao qual a evidência se refere (ex: "Sistema de drenagem")
+    equipamento_evidencia text,   -- equipamento específico citado na evidência (ex: "Bomba de incêndio P-101")
+    categoria_evidencia text,     -- natureza da evidência (ex: "Registro fotográfico", "Laudo técnico", "Medição")
+    descritivo_imagens text,      -- descrição do que aparece em fotos/imagens citadas na evidência, quando houver
     arquivo_origem text,
     criado_em timestamptz default now(),
     constraint tb_evidencias_um_pai_so check (
@@ -101,7 +111,8 @@ create table if not exists tb_arquivos_processados (
     numero_sei text,                    -- número do documento no SEI (coluna "documento" do catálogo CSV)
     numero_processo_anp text,           -- número de processo vindo do catálogo CSV (fonte de verdade, não regex/IA)
     numero_processo_divergente text,    -- número diferente encontrado no texto/pasta, se houver, só para auditoria
-    link_arquivo text,                  -- URL pública do Storage deste arquivo — permite achar o link de um documento pelo numero_sei depois
+    link_arquivo text,                  -- URL pública do PDF original no Storage — permite achar o link de um documento pelo numero_sei depois
+    link_arquivo_html text,             -- descontinuado: era a versão HTML navegável dos links de evidência, superseded por recortes de 1 página em PDF (ver tb_evidencias.link_evidencia); o app não escreve mais aqui
     criado_em timestamptz default now(),
     atualizado_em timestamptz default now()
 );
@@ -178,3 +189,14 @@ alter table tb_processos_reprocessar disable row level security;
 -- alter table tb_evidencias add column if not exists arquivo_referenciado text;
 -- alter table tb_arquivos_processados add column if not exists link_arquivo text;
 -- alter table tb_lotes_batch add column if not exists nome_arquivo_zip text;
+-- alter table tb_arquivos_processados add column if not exists link_arquivo_html text;
+-- alter table tb_auditorias add column if not exists praticas_auditadas text;
+-- alter table tb_auditorias add column if not exists documentos_solicitados text;
+-- alter table tb_auditorias add column if not exists fonte_auditoria text;
+-- alter table tb_nao_conformidades add column if not exists severidade text;
+-- alter table tb_nao_conformidades add column if not exists frequencia text;
+-- alter table tb_nao_conformidades add column if not exists elemento_critico text;
+-- alter table tb_evidencias add column if not exists sistema_evidencia text;
+-- alter table tb_evidencias add column if not exists equipamento_evidencia text;
+-- alter table tb_evidencias add column if not exists categoria_evidencia text;
+-- alter table tb_evidencias add column if not exists descritivo_imagens text;
