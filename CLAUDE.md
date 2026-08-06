@@ -126,12 +126,19 @@ app before the Documento de Fiscalização it responds to exists yet:
   LLM call *each* (never the whole NC list in one call — a big response
   risks truncating past `max_tokens`; see `ANEXO_CLAUDE_MAX_TOKENS`).
 
-Evidence links point at a single cropped PDF page (`pipeline.build_page_pdf`
-+ `db.upload_evidencia_pagina`), not a full document or an HTML
-reconstruction, so tables/stamps/layout stay intact and the text stays
-selectable. `db.insert_evidencias` also regex-extracts a referenced SEI
-number from the evidence description text (`REGEX_SEI_REFERENCIADO`) to
-link evidence to the actual source document instead of the citing document.
+Evidence links point at the original uploaded document itself (never a crop
+or an HTML reconstruction, so tables/stamps/layout/selectable text all stay
+intact), anchored to the right page via a `#page=N` URL fragment — the
+"PDF Open Parameters" convention honored by Chrome/Firefox/Edge's built-in
+PDF viewers and Adobe Reader. The extraction prompt asks the LLM for a
+verbatim `trecho` (quote) per evidence; `pipeline.localizar_pagina_por_trecho`
+finds which page contains it (falling back to `localizar_pagina_por_item`,
+which locates a page by the NC's `numero_item` instead), and
+`streamlit_app._resolver_link_pagina` appends `#page=N` to `link_arquivo`
+(see `_resolver_paginas_evidencias`, called from `finalize_result`).
+`db.insert_evidencias` also regex-extracts a referenced SEI number from the
+evidence description text (`REGEX_SEI_REFERENCIADO`) to link evidence to
+the actual source document instead of the citing document.
 
 ### Two processing paths for batches (ZIP upload)
 

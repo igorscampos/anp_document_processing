@@ -231,7 +231,7 @@ def upsert_nc(sb, id_auditoria, nc, arquivo_origem, link_arquivo=None):
             "severidade": nc.get("severidade"),
             "frequencia": nc.get("frequencia"),
             "elemento_critico": nc.get("elemento_critico"),
-            "status_atual": "pendente de resposta",
+            "status_atual": "pending response",
             "arquivo_origem": arquivo_origem,
         }).execute()
 
@@ -302,18 +302,24 @@ def insert_evidencias(sb, evidencias, arquivo_origem, id_nao_conformidade=None, 
     do esperado) sem quebrar, e evita duplicar a mesma evidência se o mesmo
     item for reprocessado ou citado de novo por outro documento. Se a
     evidência já existe (mesma descrição) mas o link salvo é de um formato
-    antigo (HTML, de antes do recorte em PDF), atualiza só o link em vez de
-    pular — sem isso, reprocessar um documento nunca corrigia o link de
-    evidências cuja descrição a IA volta a extrair igual.
+    antigo (HTML, de antes de ancorar no PDF original), atualiza só o link em
+    vez de pular — sem isso, reprocessar um documento nunca corrigia o link
+    de evidências cuja descrição a IA volta a extrair igual.
 
-    Pra cada evidência, tenta achar (via regex, ver `_extrai_arquivo_referenciado`)
-    um número SEI citado na própria descrição — se achar E já existir o link
-    daquele arquivo em `tb_arquivos_processados` (`fetch_link_arquivo`), o
-    link da evidência aponta pro arquivo QUE TEM o detalhe, não pro
-    documento atual (`link_arquivo`, usado só como fallback quando não há
-    nada mais específico pra apontar — já vem resolvido pelo chamador, ver
-    `_build_links_por_item` em streamlit_app.py: PDF de 1 página recortado na
-    posição certa, quando conhecida, senão o PDF completo).
+    Prioridade do link de cada evidência:
+    1. `ev["_link_pagina"]` — o link do documento original já ancorado pelo
+       chamador na página certa (ver `_resolver_link_pagina`/
+       `_resolver_paginas_evidencias` em streamlit_app.py: `link_arquivo` +
+       fragmento "#page=N"), localizada pelo `trecho` (ou, na falta dele,
+       pelo numero_item) desta evidência no documento atual — chave
+       transiente em memória, nunca gravada no banco.
+    2. Se não achou página própria, tenta achar (via regex, ver
+       `_extrai_arquivo_referenciado`) um número SEI citado na própria
+       descrição — se achar E já existir o link daquele arquivo em
+       `tb_arquivos_processados` (`fetch_link_arquivo`), o link da evidência
+       aponta pro arquivo QUE TEM o detalhe, não pro documento atual.
+    3. Por fim, cai em `link_arquivo` — o PDF completo do documento atual,
+       fallback de último caso.
     """
     if not evidencias:
         return
@@ -339,11 +345,13 @@ def insert_evidencias(sb, evidencias, arquivo_origem, id_nao_conformidade=None, 
             continue
 
         arquivo_referenciado = _extrai_arquivo_referenciado(descricao)
-        link_evidencia = link_arquivo
-        if arquivo_referenciado:
+        link_evidencia = ev.get("_link_pagina")
+        if not link_evidencia and arquivo_referenciado:
             link_referenciado = fetch_link_arquivo(sb, arquivo_referenciado)
             if link_referenciado:
                 link_evidencia = link_referenciado
+        if not link_evidencia:
+            link_evidencia = link_arquivo
 
         existente = existentes.get(_norm(descricao))
         if existente:
@@ -373,12 +381,12 @@ def insert_evidencias(sb, evidencias, arquivo_origem, id_nao_conformidade=None, 
 
 
 # ---------------------------------------------------------------------------
-# Supabase Storage — cada documento sobe o PDF de origem inteiro (trilha de
-# auditoria, link em `link_arquivo`); além disso, sob demanda, recortes de 1
-# página são gerados e subidos separadamente (link de evidência, em
-# `link_evidencia` — ver `pipeline.build_page_pdf` e `_build_links_por_item`
-# em streamlit_app.py), pra apontar direto na página onde a evidência foi
-# encontrada, com a formatação real do documento preservada.
+# Supabase Storage — cada documento sobe o PDF de origem inteiro UMA vez
+# (trilha de auditoria, link em `link_arquivo`). O link de evidência
+# (`link_evidencia`) reaproveita esse mesmo link, só com um fragmento
+# "#page=N" ancorando a página certa (ver `_resolver_link_pagina` em
+# streamlit_app.py) — sem gerar nem subir nenhum arquivo extra: aponta pro
+# documento original de verdade, com todo o contexto preservado.
 # ---------------------------------------------------------------------------
 BUCKET_EVIDENCIAS = "evidencias"
 
@@ -409,26 +417,6 @@ def upload_evidencia_arquivo(sb, file_bytes, file_hash, nome_arquivo, bucket=BUC
     caminho = f"{file_hash}.{extensao}"
     sb.storage.from_(bucket).upload(
         caminho, file_bytes,
-        file_options={"content-type": "application/pdf", "upsert": "true"},
-    )
-    return sb.storage.from_(bucket).get_public_url(caminho)
-
-
-def upload_evidencia_pagina(sb, pagina_bytes, file_hash, pagina, bucket=BUCKET_EVIDENCIAS):
-    """Sobe um PDF de 1 página (recortado do documento original, ver
-    `pipeline.build_page_pdf`) pro Storage e devolve a URL pública — usado
-    como link de evidência: mantém a formatação real do documento (tabelas,
-    carimbos, texto selecionável), recortado na página certa em vez do PDF
-    inteiro ou de uma reconstrução em HTML.
-
-    Nome do objeto inclui a página (`{file_hash}_p{pagina}.pdf`) — se dois
-    itens diferentes apontarem pra mesma página, o upsert reaproveita o
-    mesmo objeto em vez de duplicar.
-    """
-    ensure_bucket(sb, bucket)
-    caminho = f"{file_hash}_p{pagina}.pdf"
-    sb.storage.from_(bucket).upload(
-        caminho, pagina_bytes,
         file_options={"content-type": "application/pdf", "upsert": "true"},
     )
     return sb.storage.from_(bucket).get_public_url(caminho)

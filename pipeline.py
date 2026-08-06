@@ -27,7 +27,6 @@ import io
 import re
 
 import pdfplumber
-import pypdfium2 as pdfium
 
 # ---------------------------------------------------------------------------
 # Número de processo ANP — extração determinística por regex
@@ -105,29 +104,12 @@ def extract_text(file_bytes, max_chars):
     return "\n".join(extract_pages(file_bytes))[:max_chars]
 
 
-def build_page_pdf(file_bytes, pagina):
-    """Recorta UMA página (1-based) do PDF original como um PDF novo,
-    standalone — usado como link de evidência em vez de HTML reconstruído a
-    partir de texto puro (que perde tabela/coluna/carimbo/layout): mantém a
-    formatação real do documento, com texto ainda selecionável/pesquisável."""
-    src = pdfium.PdfDocument(file_bytes)
-    try:
-        dst = pdfium.PdfDocument.new()
-        try:
-            dst.import_pages(src, pages=[pagina - 1])
-            buf = io.BytesIO()
-            dst.save(buf)
-            return buf.getvalue()
-        finally:
-            dst.close()
-    finally:
-        src.close()
-
-
 def localizar_pagina_por_item(pages, numero_item):
     """Primeira página (1-based) que cita este numero_item como referência
     isolada (ex: "5.4") — usado pra ancorar o link de evidência na página
-    certa. Heurística por regex (como `REGEX_SEI_REFERENCIADO`), não NLP:
+    certa do documento ORIGINAL (link_arquivo + fragmento "#page=N"; ver
+    `_resolver_link_pagina` em streamlit_app.py). Heurística por regex (como
+    `REGEX_SEI_REFERENCIADO`), não NLP:
     funciona porque o prompt já instrui a IA a extrair numero_item EXATAMENTE
     como aparece no texto do próprio documento. Devolve None se não achar
     (documento pode não repetir a numeração formal em lugar nenhum, ou o item
@@ -141,21 +123,28 @@ def localizar_pagina_por_item(pages, numero_item):
     return None
 
 
-def build_mapa_paginas(pages, result):
-    """{numero_item: pagina} pra toda não conformidade/resposta do resultado
-    já extraído pela IA, localizando onde cada item é citado no texto do
-    próprio documento — computado uma vez por documento e reaproveitado pra
-    ancorar o link de cada evidência (inclusive depois, via fila de
-    pendências ou aplicação de lote, sem precisar reabrir o PDF)."""
-    mapa = {}
-    itens = [nc.get("numero_item") for nc in (result.get("nao_conformidades") or [])]
-    itens += [r.get("numero_item") for r in (result.get("respostas") or [])]
-    for numero_item in itens:
-        if numero_item and numero_item not in mapa:
-            pagina = localizar_pagina_por_item(pages, numero_item)
-            if pagina:
-                mapa[numero_item] = pagina
-    return mapa
+def _normaliza_busca(texto):
+    return re.sub(r"\s+", " ", (texto or "")).strip()
+
+
+def localizar_pagina_por_trecho(pages, trecho):
+    """Primeira página (1-based) cujo texto contém este trecho verbatim —
+    usado pra ancorar o link de evidência na página EXATA de onde ela foi
+    extraída (mais preciso que `localizar_pagina_por_item`, que só acha a
+    página onde o número do item é citado, não onde o texto da evidência em
+    si está). Normaliza espaços/quebras de linha antes de comparar, já que
+    pdfplumber pode quebrar linha de forma diferente do texto corrido que a
+    IA viu. Trechos curtos demais dariam falso positivo, por isso o mínimo
+    de caracteres. Devolve None se não achar (trecho pode ter sido levemente
+    reescrito pela IA apesar da instrução, cruzar quebra de página, ou ser
+    null quando a evidência não tem passagem direta de apoio no texto)."""
+    trecho_norm = _normaliza_busca(trecho)
+    if not trecho_norm or len(trecho_norm) < 8:
+        return None
+    for i, texto_pagina in enumerate(pages, start=1):
+        if trecho_norm.lower() in _normaliza_busca(texto_pagina).lower():
+            return i
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +363,20 @@ Formato exato:
   "respostas": []
 }}
 {dica_tipo_sei}
+IDIOMA DOS CAMPOS: escreva os VALORES dos campos de texto livre listados abaixo (resumos,
+descrições, categorias, ações, resultados, decisões etc.) EM INGLÊS, traduzindo do português do
+documento original — os dados serão armazenados em inglês. Isso NÃO se aplica a "tipo_documento" nem
+a "apresentado_por" (mantenha exatamente os valores literais especificados no formato). EXCEÇÕES que
+devem permanecer exatamente como aparecem no documento original, SEM tradução: nomes próprios
+(operadora, unidade_instalacao, auditor_responsavel, auditores_equipe); códigos, números e datas
+(numero_processo_anp, numero_relatorio, codigo_auditoria_anp, ordem_servico, cnpj_operadora,
+numero_item, norma_referencia, todas as datas); qualquer tag/código de equipamento dentro de
+equipamento_evidencia (ex: mantenha "P-101", "PSV-204" intactos, mas pode traduzir o texto ao redor,
+ex: "Bomba de incêndio P-101" -> "Fire pump P-101"); o número SEI entre parênteses citado dentro de
+uma descricao de evidência (ex: mantenha "(4529951)" intacto mesmo traduzindo o texto ao redor, já
+que esse número é extraído por regex depois); e o campo "trecho" de cada evidência, que deve ser
+sempre uma cópia literal do texto original, no idioma original, nunca traduzido.
+
 Preencha "auditoria" (objeto com codigo_auditoria_anp, ordem_servico, operadora, cnpj_operadora,
 unidade_instalacao, tipo_auditoria, sumario_auditoria, acao_demandada, data_auditoria_inicio,
 data_auditoria_fim, data_emissao_relatorio, auditor_responsavel, auditores_equipe, status_auditoria,
@@ -458,21 +461,29 @@ não encontrar) — não confundir com a data da não conformidade original.
 {dica_ncs_existentes}
 
 EVIDÊNCIAS — tanto em "nao_conformidades" quanto em "respostas", cada não conformidade normalmente
-tem VÁRIAS evidências. "evidencias" é um array de {{descricao, apresentado_por, sistema_evidencia,
-equipamento_evidencia, categoria_evidencia, descritivo_imagens}} — capture TODAS as evidências
-distintas relacionadas àquele item específico (use array vazio [] se não houver nenhuma pra esse
-item — nunca invente uma evidência que não esteja no texto):
+tem VÁRIAS evidências. "evidencias" é um array de {{descricao, trecho, apresentado_por,
+sistema_evidencia, equipamento_evidencia, categoria_evidencia, descritivo_imagens}} — capture TODAS
+as evidências distintas relacionadas àquele item específico (use array vazio [] se não houver nenhuma
+pra esse item — nunca invente uma evidência que não esteja no texto):
 - descricao: PRIORIZE o dado concreto e específico já descrito no próprio texto — medições, datas de
   ocorrências, quantidades, resultados de teste, contagens, fotos/registros mencionados — em vez de um
-  resumo genérico. Exemplos de BOA descricao: "9 vazamentos de gás detectados desde 2022, incluindo 1
-  evento TIER 1 com CH4 e CO2 sem detecção por 2 detectores no nível HH", "Teste de dilúvio em
-  12/2/2025 nos módulos 3P+2PW evidenciou subdimensionamento da drenagem", "Tanque de espuma com 68%
-  do volume necessário (4.120 m³ de 5.700 m³, capacidade reduzida em 32%)". Só descreva a evidência
-  como citação de outro documento (ex: "Carta DPBR-2024-11589 (4529951)", "Anexo 03 (4529954)") quando
-  o texto realmente aponta pra outro documento como fonte da prova, e não há detalhe observacional
-  direto disponível no próprio texto. Quando o texto citar um documento (Carta, Ofício, Anexo, Parecer,
-  laudo) como fonte de uma evidência, SEMPRE inclua o número SEI entre parênteses quando houver (ex:
-  "(4529951)", "(SEI nº 5093911)") — isso é usado para linkar a evidência ao arquivo certo depois.
+  resumo genérico. Exemplos de BOA descricao: "9 gas leaks detected since 2022, including 1 TIER 1
+  event with CH4 and CO2 undetected by 2 detectors at the HH level", "Deluge test on 2/12/2025 in
+  modules 3P+2PW showed drainage undersizing", "Foam tank at 68% of required volume (4,120 m³ of
+  5,700 m³, capacity reduced by 32%)" (lembre-se: escreva descricao em inglês, ver instrução de
+  IDIOMA DOS CAMPOS acima). Só descreva a evidência como citação de outro documento (ex: "Letter
+  DPBR-2024-11589 (4529951)", "Anexo 03 (4529954)") quando o texto realmente aponta pra outro
+  documento como fonte da prova, e não há detalhe observacional direto disponível no próprio texto.
+  Quando o texto citar um documento (Carta, Ofício, Anexo, Parecer, laudo) como fonte de uma
+  evidência, SEMPRE inclua o número SEI entre parênteses quando houver (ex: "(4529951)", "(SEI nº
+  5093911)"), mantendo o número intacto — isso é usado para linkar a evidência ao arquivo certo
+  depois.
+- trecho: uma citação literal (8 a 30 palavras) copiada EXATAMENTE do texto do documento (mesmas
+  palavras, mesma pontuação, SEMPRE no idioma original do documento — nunca traduza este campo, ao
+  contrário de descricao) que contém o dado concreto usado em "descricao" — usado para localizar e
+  recortar a página exata do PDF onde esta evidência aparece. Use null se não houver uma passagem
+  contínua do texto que sustente diretamente essa evidência específica (ex: quando a evidência é só
+  uma citação a outro documento, sem texto de apoio direto nesta página).
 - apresentado_por: "operadora" se a evidência foi submetida pela empresa fiscalizada (ex: Cartas
   da operadora, anexos técnicos enviados por ela em resposta a uma notificação); "anp" se foi a
   própria ANP quem produziu/observou a evidência (ex: registro da fiscalização, laudo do auditor,
@@ -635,9 +646,10 @@ CANDIDATO a sustentar a seguinte não conformidade já cadastrada:
 Não conformidade {numero_item}: {descricao_nc}
 
 Analise o texto do anexo e responda SOMENTE com JSON válido, sem markdown, no formato exato:
-{{"evidencias": [{{"descricao": "string", "apresentado_por": "anp|operadora|null",
-"sistema_evidencia": "string ou null", "equipamento_evidencia": "string ou null",
-"categoria_evidencia": "string ou null", "descritivo_imagens": "string ou null"}}]}}
+{{"evidencias": [{{"descricao": "string", "trecho": "string ou null",
+"apresentado_por": "anp|operadora|null", "sistema_evidencia": "string ou null",
+"equipamento_evidencia": "string ou null", "categoria_evidencia": "string ou null",
+"descritivo_imagens": "string ou null"}}]}}
 
 Confirme pelo conteúdo REAL do texto (não assuma só porque foi pré-selecionado) se este anexo
 sustenta essa não conformidade específica. Se sim, extraia TODAS as evidências distintas
@@ -645,6 +657,14 @@ sustenta essa não conformidade específica. Se sim, extraia TODAS as evidência
 dado concreto sobre resumo genérico, mesmos critérios do prompt principal. Se o anexo não tiver
 relação real com esta não conformidade, responda {{"evidencias": []}}. Nunca invente uma evidência
 que não esteja no texto do anexo.
+
+IDIOMA: escreva "descricao", "sistema_evidencia", "equipamento_evidencia" (exceto tags/códigos de
+equipamento, ex: "P-101" — mantenha intactas), "categoria_evidencia" e "descritivo_imagens" EM
+INGLÊS, traduzindo do português do anexo. "trecho" é a exceção: deve ser uma citação literal (8 a 30
+palavras) copiada EXATAMENTE do texto do anexo, no idioma original, nunca traduzida — usada pra
+recortar a página exata do PDF; use null se não houver passagem contínua de apoio direto. Mantenha
+também intactos: qualquer número SEI entre parênteses citado dentro de descricao (ex: "(4529951)") e
+o valor de apresentado_por (anp|operadora|null, sem tradução).
 
 TEXTO DO ANEXO (pode estar truncado):
 ---

@@ -188,7 +188,7 @@ def match_resposta_to_nc(r, ncs):
 # ---------------------------------------------------------------------------
 # Lógica de vínculo — reutilizada tanto no upload quanto na fila de retentativa
 # ---------------------------------------------------------------------------
-def apply_auditoria(result, filename, is_df=False, link_arquivo=None, links_por_item=None):
+def apply_auditoria(result, filename, is_df=False, link_arquivo=None):
     """auditoria_oficial sempre "resolve" na hora: cria ou atualiza.
 
     Não conformidades só são gravadas quando "is_df" — o documento é o
@@ -198,11 +198,11 @@ def apply_auditoria(result, filename, is_df=False, link_arquivo=None, links_por_
     exclusivamente do DF (ou de vários DFs, se o processo tiver mais de um —
     todos contribuem, upsert_nc já mescla por numero_item).
 
-    "link_arquivo" é o PDF completo deste arquivo (fallback) e
-    "links_por_item" (opcional) é {numero_item: link do recorte de 1 página}
-    já resolvido por `_build_links_por_item` — cada NC usa o recorte da
-    página onde seu próprio numero_item foi citado, quando conhecido, senão
-    cai no PDF completo.
+    "link_arquivo" é o PDF completo deste arquivo — fallback só usado pra
+    evidências cuja página não foi localizada (cada evidência já carrega seu
+    próprio link ancorado na página certa em `ev["_link_pagina"]`, resolvido
+    antes pra todo o "result" por `_resolver_paginas_evidencias`, ver
+    `finalize_result`).
     """
     aud = {k: v for k, v in {
         "numero_processo_anp": result.get("numero_processo_anp"),
@@ -212,10 +212,8 @@ def apply_auditoria(result, filename, is_df=False, link_arquivo=None, links_por_
     id_auditoria = db.upsert_auditoria(sb, aud, filename)
     n = 0
     if is_df:
-        links_por_item = links_por_item or {}
         for nc in result.get("nao_conformidades", []):
-            link_nc = links_por_item.get(nc.get("numero_item"), link_arquivo)
-            db.upsert_nc(sb, id_auditoria, nc, filename, link_arquivo=link_nc)
+            db.upsert_nc(sb, id_auditoria, nc, filename, link_arquivo=link_arquivo)
         n = len(result.get("nao_conformidades", []))
         # Quando há mais de um DF no mesmo processo, o mais informativo (mais
         # não conformidades + mais campos de auditoria preenchidos) deve ficar
@@ -225,24 +223,23 @@ def apply_auditoria(result, filename, is_df=False, link_arquivo=None, links_por_
     return id_auditoria, n
 
 
-def try_apply_respostas(numero_processo_anp, numero_relatorio, respostas, tipo, filename, link_arquivo=None, links_por_item=None):
+def try_apply_respostas(numero_processo_anp, numero_relatorio, respostas, tipo, filename, link_arquivo=None):
     """Tenta vincular cada resposta a uma não conformidade existente.
 
     Retorna (status, itens_nao_resolvidos, mensagem).
     status: 'concluido' | 'parcial' | 'pendente_vinculo'
 
-    "link_arquivo" é o PDF completo deste arquivo (fallback) e
-    "links_por_item" (opcional) é {numero_item: link do recorte de 1 página}
-    já resolvido por `_build_links_por_item` — usa o numero_item ORIGINAL da
-    resposta (como extraído deste documento), mesmo quando ela é recasada
-    pra outra NC por assunto — é sobre onde este documento cita seu próprio
-    item, não sobre o id da NC de destino.
+    "link_arquivo" é o PDF completo deste arquivo — fallback só usado pra
+    evidências cuja página não foi localizada (cada evidência já carrega seu
+    próprio link ancorado na página certa em `ev["_link_pagina"]`, resolvido
+    antes pra todo o "result" por `_resolver_paginas_evidencias`, ver
+    `finalize_result` — sobrevive ao round-trip de `payload_json` quando a
+    resposta cai na fila de pendências, sem precisar reabrir o PDF aqui).
     """
     aud = db.find_auditoria(sb, numero_processo_anp, numero_relatorio)
     if not aud:
         return "pendente_vinculo", respostas, "auditoria ainda não cadastrada"
 
-    links_por_item = links_por_item or {}
     resolvidos, pendentes = 0, []
     ncs_cache = None
     for r in respostas:
@@ -261,8 +258,7 @@ def try_apply_respostas(numero_processo_anp, numero_relatorio, respostas, tipo, 
         if not nc:
             pendentes.append(r)
             continue
-        link_r = links_por_item.get(r.get("numero_item"), link_arquivo)
-        db.insert_resposta(sb, nc["id_nao_conformidade"], aud["id_auditoria"], tipo, r, filename, link_arquivo=link_r)
+        db.insert_resposta(sb, nc["id_nao_conformidade"], aud["id_auditoria"], tipo, r, filename, link_arquivo=link_arquivo)
         resolvidos += 1
 
     if not pendentes:
@@ -291,7 +287,6 @@ def retry_pending_queue():
             payload.get("tipo_documento"),
             item["nome_arquivo"],
             link_arquivo=payload.get("link_arquivo"),
-            links_por_item=payload.get("links_por_item"),
         )
         if status != item["status"] or len(pendentes) != len(payload.get("respostas", [])):
             novo_payload = {**payload, "respostas": pendentes} if pendentes else None
@@ -307,25 +302,46 @@ def retry_pending_queue():
 # ---------------------------------------------------------------------------
 # Processamento de um upload
 # ---------------------------------------------------------------------------
-def _build_links_por_item(file_bytes, file_hash, mapa_paginas):
-    """Recorta e sobe 1 PDF de página (ver `pipeline.build_page_pdf`) pra
-    cada numero_item cuja página foi localizada em `mapa_paginas` — vira o
-    link de evidência daquele item específico. Falha ao recortar/subir uma
-    página não derruba as demais (best-effort — quem chama já cai no PDF
-    completo como fallback pra esse item se ele não aparecer no dict)."""
-    links = {}
-    for numero_item, pagina in mapa_paginas.items():
-        try:
-            pagina_bytes = pipeline.build_page_pdf(file_bytes, pagina)
-            links[numero_item] = db.upload_evidencia_pagina(sb, pagina_bytes, file_hash, pagina)
-        except Exception:
-            continue
-    return links
+def _resolver_link_pagina(pages, trecho, numero_item, link_arquivo):
+    """Ancora o link de UMA evidência na página certa do documento ORIGINAL
+    (não um recorte separado) — localiza a página pelo `trecho` verbatim
+    (mais preciso: aponta pra onde o texto da evidência realmente está),
+    senão pelo `numero_item` (heurística mais grosseira: só acha onde o
+    número do item é citado, não onde a evidência específica está), e
+    devolve `link_arquivo` (o PDF completo já enviado, ver
+    `db.upload_evidencia_arquivo`) com um fragmento "#page=N" — convenção de
+    "PDF Open Parameters" respeitada pelo visualizador nativo de PDF do
+    Chrome/Firefox/Edge e pelo Adobe Reader, que abrem o PDF direto na
+    página certa. Devolve None se não achar página (quem chama cai no link
+    do documento completo, sem fragmento, nesse caso)."""
+    if not link_arquivo:
+        return None
+    pagina = pipeline.localizar_pagina_por_trecho(pages, trecho) if trecho else None
+    if not pagina and numero_item:
+        pagina = pipeline.localizar_pagina_por_item(pages, numero_item)
+    if not pagina:
+        return None
+    return f"{link_arquivo}#page={pagina}"
+
+
+def _resolver_paginas_evidencias(pages, link_arquivo, evidencias_por_item):
+    """Resolve `ev["_link_pagina"]` in-place pra toda evidência em
+    `evidencias_por_item` — lista de {numero_item, evidencias}, tanto de
+    "nao_conformidades" quanto de "respostas". Como o link fica gravado no
+    próprio dict da evidência, ele sobrevive ao round-trip de `payload_json`
+    na fila de pendências sem precisar guardar um mapa à parte nem reabrir o
+    PDF depois."""
+    for item in evidencias_por_item:
+        for ev in item.get("evidencias") or []:
+            if not isinstance(ev, dict):
+                continue
+            link = _resolver_link_pagina(pages, ev.get("trecho"), item.get("numero_item"), link_arquivo)
+            if link:
+                ev["_link_pagina"] = link
 
 
 def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, numero_override=None, is_df=False,
-                     numero_sei=None, numero_processo_divergente=None, link_arquivo=None,
-                     file_bytes=None, pages=None):
+                     numero_sei=None, numero_processo_divergente=None, link_arquivo=None, pages=None):
     """Aplica overrides determinísticos, o gate de confiança e grava o resultado.
 
     Compartilhado entre o processamento síncrono (upload direto, 1 chamada de
@@ -334,17 +350,21 @@ def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, nume
     "result" (JSON já classificado pela IA) chegou até aqui; a partir daqui a
     lógica de vínculo é idêntica pros três.
 
-    "pages" (texto por página, quando disponível) monta "mapa_paginas"
-    ({numero_item: pagina}, ver `pipeline.build_mapa_paginas`); "file_bytes"
-    (os bytes do PDF original) é usado junto disso pra recortar e subir 1 PDF
-    de página por item via `_build_links_por_item` — os links de evidência já
-    saem apontando pro recorte certo, sem precisar reabrir o PDF depois (fila
-    de pendências e aplicação de lote guardam só os links já resolvidos, não
-    as páginas nem os bytes).
+    "pages" (texto por página, quando disponível) é usado por
+    `_resolver_paginas_evidencias` pra ancorar cada evidência na página certa
+    do documento ORIGINAL (localizada pelo `trecho` verbatim da evidência, ou
+    pelo numero_item do seu item como fallback) — o link já fica gravado em
+    `ev["_link_pagina"]` de cada evidência dentro de "result" (link_arquivo +
+    fragmento "#page=N"), sem precisar reabrir o PDF depois (fila de
+    pendências e aplicação de lote guardam só o "result" já resolvido, não as
+    páginas).
     """
     tipo = result["tipo_documento"]
-    mapa_paginas = pipeline.build_mapa_paginas(pages, result) if pages else {}
-    links_por_item = _build_links_por_item(file_bytes, file_hash, mapa_paginas) if file_bytes and mapa_paginas else {}
+    if pages:
+        _resolver_paginas_evidencias(
+            pages, link_arquivo,
+            (result.get("nao_conformidades") or []) + (result.get("respostas") or []),
+        )
 
     # Override determinístico: o catálogo do SEI já classificou este documento
     # como Documento de Fiscalização (ou peça oficial equivalente) — não
@@ -372,7 +392,7 @@ def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, nume
     processo_label = f" [processo {result.get('numero_processo_anp') or '—'}]"
 
     if tipo == "auditoria_oficial":
-        id_auditoria, n = apply_auditoria(result, nome_arquivo, is_df=is_df, link_arquivo=link_arquivo, links_por_item=links_por_item)
+        id_auditoria, n = apply_auditoria(result, nome_arquivo, is_df=is_df, link_arquivo=link_arquivo)
         db.upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo, result["confianca"], "concluido", f"auditoria {id_auditoria}", link_arquivo=link_arquivo, **rastreio)
         resolvidos = retry_pending_queue()
         detalhe = f"auditoria {id_auditoria} atualizada com {n} não conformidade(s){processo_label}"
@@ -383,7 +403,7 @@ def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, nume
     # resposta_operadora ou parecer_anp
     status, pendentes, msg = try_apply_respostas(
         result.get("numero_processo_anp"), result.get("numero_relatorio"),
-        result.get("respostas", []), tipo, nome_arquivo, link_arquivo=link_arquivo, links_por_item=links_por_item,
+        result.get("respostas", []), tipo, nome_arquivo, link_arquivo=link_arquivo,
     )
     msg += processo_label
     # Salva o payload sempre que NÃO resolveu de vez (mesmo se "pendentes"
@@ -400,14 +420,13 @@ def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, nume
             "numero_relatorio": result.get("numero_relatorio"),
             "respostas": pendentes,
             "link_arquivo": link_arquivo,
-            "links_por_item": links_por_item,
         }
     db.upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo, result["confianca"], status, msg, payload, link_arquivo=link_arquivo, **rastreio)
     status_label = {"concluido": "concluido", "parcial": "revisao", "pendente_vinculo": "revisao"}[status]
     return status_label, msg
 
 
-def _extrair_evidencias_anexo(texto_anexo, ncs_candidatas, id_auditoria, nome_arquivo, link_arquivo):
+def _extrair_evidencias_anexo(texto_anexo, ncs_candidatas, id_auditoria, nome_arquivo, link_arquivo, pages=None):
     """Chama a IA UMA VEZ POR NC candidata (nunca a lista inteira numa
     chamada só — resposta grande o bastante estoura max_tokens e volta JSON
     truncado, ver `pipeline.PROMPT_ANEXO_EVIDENCIA`). Cada chamada é isolada
@@ -415,7 +434,12 @@ def _extrair_evidencias_anexo(texto_anexo, ncs_candidatas, id_auditoria, nome_ar
     mesmo anexo. Devolve (total_evidencias, ncs_atingidas, falhas, erros) —
     "erros" guarda a mensagem real de cada falha (não só a contagem), pra dar
     pra diagnosticar direto pelo "motivo" salvo no banco sem precisar
-    reproduzir a chamada manualmente."""
+    reproduzir a chamada manualmente.
+
+    "pages" (quando disponível) ancora cada evidência na página exata do
+    próprio anexo (via `_resolver_link_pagina`, mesmo mecanismo do fluxo
+    principal: `link_arquivo` + fragmento "#page=N"), em vez de linkar só a
+    primeira página do anexo (fallback quando a página não é localizada)."""
     total_evidencias, ncs_atingidas, falhas, erros = 0, 0, 0, []
     for nc_cand in ncs_candidatas:
         try:
@@ -434,6 +458,13 @@ def _extrair_evidencias_anexo(texto_anexo, ncs_candidatas, id_auditoria, nome_ar
         nc = db.find_nc(sb, id_auditoria, nc_cand.get("numero_item"))
         if not nc:
             continue
+        if pages:
+            for ev in evidencias:
+                if not isinstance(ev, dict):
+                    continue
+                link = _resolver_link_pagina(pages, ev.get("trecho"), nc_cand.get("numero_item"), link_arquivo)
+                if link:
+                    ev["_link_pagina"] = link
         db.insert_evidencias(sb, evidencias, nome_arquivo, id_nao_conformidade=nc["id_nao_conformidade"], link_arquivo=link_arquivo)
         total_evidencias += len(evidencias)
         ncs_atingidas += 1
@@ -483,7 +514,9 @@ def _try_processar_anexo(file_bytes, file_hash, nome_arquivo, doc_id, numero_cat
         )
         return "concluido", motivo
 
-    total_evidencias, ncs_atingidas, falhas, erros = _extrair_evidencias_anexo(texto_anexo, candidatas, aud["id_auditoria"], nome_arquivo, link_anexo)
+    total_evidencias, ncs_atingidas, falhas, erros = _extrair_evidencias_anexo(
+        texto_anexo, candidatas, aud["id_auditoria"], nome_arquivo, link_anexo, pages=pages,
+    )
 
     # "erro" só se TODAS as candidatas falharam na chamada de IA — falha
     # parcial (algumas OK, outras não) ainda é "concluido", com a contagem de
@@ -535,7 +568,9 @@ def _retry_anexo_pendente(item, payload):
     if not candidatas:
         motivo = "sem correspondência de vocabulário com as não conformidades do processo — IA não foi chamada"
     else:
-        total_evidencias, ncs_atingidas, falhas, erros = _extrair_evidencias_anexo(texto_anexo, candidatas, aud["id_auditoria"], item["nome_arquivo"], link_anexo)
+        total_evidencias, ncs_atingidas, falhas, erros = _extrair_evidencias_anexo(
+            texto_anexo, candidatas, aud["id_auditoria"], item["nome_arquivo"], link_anexo, pages=pages,
+        )
         if falhas and falhas == len(candidatas):
             return None  # todas as chamadas falharam — tenta de novo na próxima passada da fila
         motivo = (
@@ -650,7 +685,7 @@ def process_one_file(file_bytes, nome_arquivo, catalogo=None, force=False, numer
     return finalize_result(
         result, file_hash, nome_arquivo, decisao_catalogo, numero_override=numero_override, is_df=is_df,
         numero_sei=doc_id, numero_processo_divergente=numero_divergente, link_arquivo=link_arquivo,
-        file_bytes=file_bytes, pages=pages,
+        pages=pages,
     )
 
 
@@ -883,26 +918,26 @@ def apply_batch_result(item, result):
         )
         return "erro", motivo
 
-    # Recortar página por item exige o numero_item, que só existe agora — sem
-    # mais os bytes do PDF em memória (o lote pode ter levado horas), baixa
-    # de novo do link já salvo (best-effort: se falhar, segue sem recorte,
-    # `finalize_result` cai no PDF completo já linkado via `link_arquivo`).
-    file_bytes, pages = None, None
+    # Ancorar a página certa por evidência exige o texto por página, que só
+    # existe agora — sem mais os bytes do PDF em memória (o lote pode ter
+    # levado horas), baixa de novo do link já salvo (best-effort: se falhar,
+    # segue sem página, `finalize_result` cai no link do documento completo
+    # sem fragmento).
+    pages = None
     if item.get("link_arquivo"):
         try:
             import requests
             resp = requests.get(item["link_arquivo"], timeout=30)
             resp.raise_for_status()
-            file_bytes = resp.content
-            pages = pipeline.extract_pages(file_bytes)
+            pages = pipeline.extract_pages(resp.content)
         except Exception:
-            file_bytes, pages = None, None
+            pages = None
 
     return finalize_result(
         parsed, file_hash, nome_arquivo, decisao_catalogo, numero_override=numero_override,
         is_df=item.get("is_df", False), numero_sei=item.get("numero_sei"),
         numero_processo_divergente=item.get("numero_processo_divergente"), link_arquivo=item.get("link_arquivo"),
-        file_bytes=file_bytes, pages=pages,
+        pages=pages,
     )
 
 
