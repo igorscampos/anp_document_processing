@@ -213,6 +213,30 @@ TIPOS_DF = {
     "documento de fiscalização",
 }
 
+# Catálogo das 17 Práticas de Gestão do SGSO (Regulamento Técnico do Sistema
+# de Gerenciamento da Segurança Operacional, ANP/2007), com seus subitens —
+# usado no prompt de extração para preencher `norma_referencia` de cada não
+# conformidade: número da prática ("N" ou "N.M") violada, extraído do próprio
+# documento quando citado explicitamente, ou inferido pelo assunto usando este
+# catálogo como referência quando o documento não citar a prática diretamente.
+PRATICAS_GESTAO_SGSO = """1 - Cultura de Segurança, Compromisso e Responsabilidade Gerencial (1.2 Valores e Política de Segurança; 1.3 Estrutura Organizacional e Responsabilidade Gerencial; 1.4 Sistema de Comunicação; 1.5 Disponibilização e Planejamento de Recursos)
+2 - Envolvimento do Pessoal (2.2 Participação do Pessoal)
+3 - Qualificação, Treinamento e Desempenho do Pessoal (3.2 Estrutura Organizacional; 3.3 Treinamento)
+4 - Ambiente de Trabalho e Fatores Humanos
+5 - Seleção, Controle e Gerenciamento de Contratadas (5.2 Seleção e Avaliação de Contratadas; 5.3 Responsabilidades do Operador da Instalação; 5.4 Treinamento de Contratadas)
+6 - Monitoramento e Melhoria Contínua do Desempenho (6.2 Indicadores e Metas de Desempenho de Segurança; 6.3 Monitoramento)
+7 - Auditorias (7.2 Planejamento da Auditoria; 7.3 Execução da Auditoria; 7.4 Avaliação da Auditoria)
+8 - Gestão da Informação e da Documentação (8.2 Responsabilidades na Gestão da Informação; 8.3 Acesso à Informação)
+9 - Investigação de Incidentes (9.2 Procedimentos e Organização da Investigação; 9.3 Execução da Investigação; 9.4 Ações Corretivas; 9.5 Ações Preventivas)
+10 - Projeto, Construção, Instalação e Desativação (10.2 Gestão e Organização; 10.3 Segurança nas Fases de Projeto, Construção, Instalação e Desativação)
+11 - Elementos Críticos de Segurança Operacional (11.2 Identificação dos Elementos Críticos de Segurança Operacional; 11.3 Gerenciamento e Controle dos Elementos Críticos de Segurança Operacional)
+12 - Identificação e Análise de Riscos (12.2 Tipos de Análise de Riscos; 12.3 Metodologia de Identificação e Análise de Riscos; 12.4 Execução da Análise de Riscos; 12.5 Elaboração do Relatório de Identificação e Análise de Riscos; 12.6 Resultados)
+13 - Integridade Mecânica (13.2 Planejamento de Inspeção, Teste, Manutenção e Suprimento de Materiais; 13.3 Controle das Atividades; 13.4 Monitoramento e Avaliação de Resultados)
+14 - Planejamento e Gerenciamento de Grandes Emergências (14.2 Planejamento de Situações de Emergência; 14.3 Resposta a Grandes Emergências; 14.4 Gestão dos Recursos de Resposta; 14.5 Sistema de Comunicação; 14.6 Exercícios Simulados; 14.7 Revisão do Plano de Emergência)
+15 - Procedimentos Operacionais (15.2 Elaboração e Controle dos Procedimentos Operacionais; 15.3 Procedimentos para Partida e Desativação; 15.4 Operações Simultâneas)
+16 - Gerenciamento de Mudanças (16.2 Tipos de Mudanças; 16.3 Procedimentos de Controle)
+17 - Práticas de Trabalho Seguro e Procedimentos de Controle em Atividades Especiais (17.2 Permissão de Trabalho; 17.3 Monitoramento)"""
+
 
 def _norm_tipo(tipo):
     return (tipo or "").strip().lower()
@@ -419,9 +443,23 @@ Detalhe de cada campo novo de "auditoria":
   "Marinha" (Autoridade Marítima/Marinha do Brasil) ou outro órgão explicitamente citado como
   responsável pela fiscalização. Use "ANP" como padrão se o texto não indicar outro órgão claramente.
 
+CATÁLOGO DE PRÁTICAS DE GESTÃO DO SGSO (Regulamento Técnico do Sistema de Gerenciamento da
+Segurança Operacional, ANP) — use para preencher "norma_referencia" de cada não conformidade:
+{praticas_gestao_sgso}
+
 Detalhe de cada campo novo de "nao_conformidades":
 - categoria_nao_conformidade: área temática do item (ex: "Gestão de risco", "Sistema de drenagem",
   "Integridade estrutural", "Comunicação", "Atmosfera explosiva"), em 2-4 palavras.
+- norma_referencia: o número da Prática de Gestão do SGSO violada por este item, no formato "N" ou
+  "N.M" (ex: "7", "13.2") — N de 1 a 17 conforme o CATÁLOGO acima, M o subitem quando o assunto
+  corresponder especificamente a um subitem listado. PRIORIZE um número de prática/subitem citado
+  explicitamente no próprio texto do documento (ex: "Prática de Gestão nº 7", "item 13.2 do SGSO",
+  "descumprimento à prática de gestão 9") — copie esse número literalmente. Se o documento NÃO citar
+  isso explicitamente, escolha, você mesmo, o número do CATÁLOGO acima que MELHOR corresponde ao
+  ASSUNTO desta não conformidade (ex: um achado sobre plano de treinamento de emergência corresponde
+  à prática 14; um achado sobre inspeção de válvulas corresponde à prática 13). Preencha sempre com o
+  número mais próximo, mesmo por inferência — use null somente se o assunto não se encaixar em
+  nenhuma das 17 práticas.
 - acao_recomendada: a ação que a ANP exige da operadora para sanar especificamente este item,
   em até 20 palavras (geralmente o próprio texto da notificação, ex: "Refazer o estudo de
   dispersão de gases considerando condição de calmaria").
@@ -540,7 +578,12 @@ def build_prompt(texto, tipo_sei=None, nao_conformidades_existentes=None):
                 "de inventar um número.\n"
             )
 
-    return PROMPT.format(texto=texto, dica_tipo_sei=dica, dica_ncs_existentes=dica_ncs)
+    return PROMPT.format(
+        texto=texto,
+        dica_tipo_sei=dica,
+        dica_ncs_existentes=dica_ncs,
+        praticas_gestao_sgso=PRATICAS_GESTAO_SGSO,
+    )
 
 
 # ---------------------------------------------------------------------------
