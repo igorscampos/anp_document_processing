@@ -38,6 +38,10 @@ setup flow) or equivalent environment variables, read via `get_secret()` in
   deepseek-r1...) or the JSON response ends up in the `thinking` field
   instead of `response` and the app breaks.
 - `CLAUDE_MAX_CHARS` — char budget for the extracted PDF text sent to Claude.
+- `BATCH_MAX_ARQUIVOS` (default `10`) — batches with this many files or more
+  are skipped by `process_pending_batches()` (the "verificar resultados dos
+  lotes pendentes" button) instead of being auto-applied; they stay pending
+  for manual processing.
 
 Database schema lives in `schema.sql` — run it once in the Supabase SQL
 Editor. It's additive/idempotent (`create table if not exists`); if you add

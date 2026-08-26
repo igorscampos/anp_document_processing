@@ -21,6 +21,7 @@ import io
 import json
 import os
 import pathlib
+import time
 import zipfile
 
 import streamlit as st
@@ -73,6 +74,10 @@ OLLAMA_NUM_PREDICT = int(get_secret("OLLAMA_NUM_PREDICT", "4096"))
 OLLAMA_THINK = get_secret("OLLAMA_THINK", "false").strip().lower() in ("true", "1", "yes")
 
 CLAUDE_MAX_CHARS = int(get_secret("CLAUDE_MAX_CHARS", "80000"))
+
+# Lotes com esse número de arquivos ou mais não são aplicados automaticamente
+# pelo botão de verificar resultados — ficam pendentes até processamento manual.
+BATCH_MAX_ARQUIVOS = int(get_secret("BATCH_MAX_ARQUIVOS", "10"))
 
 if not (SUPABASE_URL and SUPABASE_KEY):
     st.error("Faltam credenciais do Supabase (SUPABASE_URL, SUPABASE_KEY) em .streamlit/secrets.toml.")
@@ -268,10 +273,20 @@ def try_apply_respostas(numero_processo_anp, numero_relatorio, respostas, tipo, 
     return "parcial", pendentes, f"{resolvidos} vinculada(s), {len(pendentes)} aguardando item correspondente"
 
 
-def retry_pending_queue():
-    """Roda depois de toda auditoria nova: tenta resolver a fila de pendências."""
+def retry_pending_queue(on_pendencia=None):
+    """Roda depois de toda auditoria nova: tenta resolver a fila de pendências.
+
+    "on_pendencia" (opcional) é chamado a cada item avaliado com
+    (nome_arquivo, indice, total) — usado pra UI mostrar progresso enquanto
+    a fila inteira é revarrida, já que essa varredura pode envolver uma
+    chamada à IA por item (ver `try_apply_respostas` -> `match_resposta_to_nc`).
+    """
     resolvidos = []
-    for item in db.fetch_pendentes(sb):
+    pendentes_todos = db.fetch_pendentes(sb)
+    total = len(pendentes_todos)
+    for i, item in enumerate(pendentes_todos):
+        if on_pendencia:
+            on_pendencia(item["nome_arquivo"], i + 1, total)
         payload = item["payload_json"] or {}
 
         if payload.get("tipo_documento") == "anexo_evidencia":
@@ -341,7 +356,8 @@ def _resolver_paginas_evidencias(pages, link_arquivo, evidencias_por_item):
 
 
 def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, numero_override=None, is_df=False,
-                     numero_sei=None, numero_processo_divergente=None, link_arquivo=None, pages=None):
+                     numero_sei=None, numero_processo_divergente=None, link_arquivo=None, pages=None,
+                     skip_retry_queue=False):
     """Aplica overrides determinísticos, o gate de confiança e grava o resultado.
 
     Compartilhado entre o processamento síncrono (upload direto, 1 chamada de
@@ -349,6 +365,12 @@ def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, nume
     lote da Batch API — a única diferença entre os três fluxos é como
     "result" (JSON já classificado pela IA) chegou até aqui; a partir daqui a
     lógica de vínculo é idêntica pros três.
+
+    "skip_retry_queue" evita rodar `retry_pending_queue()` aqui — usado pela
+    aplicação de lote da Batch API, que já roda essa fila UMA vez só depois
+    de aplicar todos os itens, em vez de uma vez por auditoria concluída
+    (ver `process_pending_batches`); upload direto e fila síncrona do ZIP
+    continuam resolvendo a fila imediatamente (default `False`).
 
     "pages" (texto por página, quando disponível) é usado por
     `_resolver_paginas_evidencias` pra ancorar cada evidência na página certa
@@ -394,10 +416,11 @@ def finalize_result(result, file_hash, nome_arquivo, decisao_catalogo=None, nume
     if tipo == "auditoria_oficial":
         id_auditoria, n = apply_auditoria(result, nome_arquivo, is_df=is_df, link_arquivo=link_arquivo)
         db.upsert_arquivo_status(sb, file_hash, nome_arquivo, tipo, result["confianca"], "concluido", f"auditoria {id_auditoria}", link_arquivo=link_arquivo, **rastreio)
-        resolvidos = retry_pending_queue()
         detalhe = f"auditoria {id_auditoria} atualizada com {n} não conformidade(s){processo_label}"
-        if resolvidos:
-            detalhe += f" — também resolveu da fila: {', '.join(resolvidos)}"
+        if not skip_retry_queue:
+            resolvidos = retry_pending_queue()
+            if resolvidos:
+                detalhe += f" — também resolveu da fila: {', '.join(resolvidos)}"
         return "concluido", detalhe
 
     # resposta_operadora ou parecer_anp
@@ -892,7 +915,7 @@ def submit_batch(batch_requests, itens, nome_arquivo_zip=None):
     return batch.id
 
 
-def apply_batch_result(item, result):
+def apply_batch_result(item, result, skip_retry_queue=False):
     """Aplica o resultado de UM item de um lote já finalizado (`ended`)."""
     nome_arquivo = item["nome_arquivo"]
     file_hash = item["hash_arquivo"]
@@ -937,11 +960,11 @@ def apply_batch_result(item, result):
         parsed, file_hash, nome_arquivo, decisao_catalogo, numero_override=numero_override,
         is_df=item.get("is_df", False), numero_sei=item.get("numero_sei"),
         numero_processo_divergente=item.get("numero_processo_divergente"), link_arquivo=item.get("link_arquivo"),
-        pages=pages,
+        pages=pages, skip_retry_queue=skip_retry_queue,
     )
 
 
-def process_pending_batches(on_item=None):
+def process_pending_batches(on_item=None, on_lote=None, on_pendencia=None):
     """Verifica todos os lotes ainda não concluídos e aplica os resultados prontos.
 
     Cada item e cada lote são isolados em try/except — um resultado com
@@ -950,15 +973,37 @@ def process_pending_batches(on_item=None):
     vez de derrubar a verificação inteira e quebrar a página no Streamlit.
 
     Aplicar um lote grande é lento: cada item leva várias chamadas
-    sequenciais ao Supabase (e `retry_pending_queue` reprocessa a fila
-    inteira a cada auditoria concluída), então um lote com dezenas de itens
-    pode levar minutos nessa função. Sem feedback nenhum, um clique nessa
-    função parece travado no meio do caminho — "on_item" (opcional) é
-    chamado a cada item aplicado com (nome_arquivo, status_label, indice,
-    total) pra UI mostrar o progresso real em vez de um spinner mudo.
+    sequenciais ao Supabase. Pra evitar que isso vire trabalho quadrático,
+    a fila de pendências NÃO é reprocessada uma vez por auditoria concluída
+    (como no upload direto) — cada item aqui é aplicado com
+    `skip_retry_queue=True`, e `retry_pending_queue()` roda só UMA vez, no
+    final, depois que todos os lotes deste clique já foram aplicados.
+
+    "on_item" (opcional) é chamado a cada item aplicado com (nome_arquivo,
+    status_label, indice, total); "on_lote" (opcional) é chamado nas
+    transições de cada lote com (id_lote, indice, total_lotes, fase) —
+    fase em "consultando", "pulado", "em_processamento", "aplicando";
+    "on_pendencia" (opcional) é repassado pra `retry_pending_queue` no passo
+    final. Sem esses callbacks, um clique nessa função parece travado no
+    meio do caminho, principalmente durante a resolução final da fila.
     """
     resumo = []
-    for lote in db.fetch_lotes_batch(sb, status_excluir="concluido"):
+    lotes = db.fetch_lotes_batch(sb, status_excluir="concluido")
+    total_lotes = len(lotes)
+    algum_item_aplicado = False
+
+    for idx, lote in enumerate(lotes):
+        if on_lote:
+            on_lote(lote["id_lote"], idx + 1, total_lotes, "consultando")
+
+        if lote["total_itens"] >= BATCH_MAX_ARQUIVOS:
+            resumo.append(
+                f"{lote['id_lote']}: pulado — lote com {lote['total_itens']} arquivo(s), "
+                f"acima do limite de processamento automático ({BATCH_MAX_ARQUIVOS})"
+            )
+            if on_lote:
+                on_lote(lote["id_lote"], idx + 1, total_lotes, "pulado")
+            continue
         try:
             batch = _claude_client.messages.batches.retrieve(lote["id_lote"])
         except Exception as e:
@@ -968,21 +1013,26 @@ def process_pending_batches(on_item=None):
         if batch.processing_status != "ended":
             db.upsert_lote_batch(sb, lote["id_lote"], batch.processing_status, lote["total_itens"], lote["itens_json"])
             resumo.append(f"{lote['id_lote']}: ainda '{batch.processing_status}'")
+            if on_lote:
+                on_lote(lote["id_lote"], idx + 1, total_lotes, "em_processamento")
             continue
 
         itens = lote["itens_json"] or {}
         total = len(itens)
         contagem = {}
+        if on_lote:
+            on_lote(lote["id_lote"], idx + 1, total_lotes, "aplicando")
         for i, result in enumerate(_claude_client.messages.batches.results(lote["id_lote"])):
             item = itens.get(result.custom_id)
             if not item:
                 continue
             try:
-                status_label, _ = apply_batch_result(item, result)
+                status_label, _ = apply_batch_result(item, result, skip_retry_queue=True)
             except Exception as e:
                 db.upsert_arquivo_status(sb, item["hash_arquivo"], item["nome_arquivo"], item.get("tipo_sei"), 0.0, "erro", f"lote: falha ao aplicar resultado — {e}")
                 status_label = "erro"
             contagem[status_label] = contagem.get(status_label, 0) + 1
+            algum_item_aplicado = True
             if on_item:
                 on_item(item["nome_arquivo"], status_label, i + 1, total)
 
@@ -991,6 +1041,12 @@ def process_pending_batches(on_item=None):
             f"{lote['id_lote']}: concluído — {contagem.get('concluido', 0)} ok, "
             f"{contagem.get('revisao', 0)} revisão, {contagem.get('erro', 0)} erro"
         )
+
+    if algum_item_aplicado:
+        resolvidos = retry_pending_queue(on_pendencia=on_pendencia)
+        if resolvidos:
+            resumo.append(f"fila pendente: resolvido(s) {len(resolvidos)} — {', '.join(resolvidos)}")
+
     return resumo
 
 
@@ -1141,13 +1197,32 @@ if LLM_PROVIDER == "claude":
     if st.button("🔄 Verificar / baixar resultados dos lotes pendentes"):
         progress = st.progress(0.0)
         log = st.empty()
+        inicio = time.time()
+
+        def _decorrido():
+            return f"{time.time() - inicio:.0f}s decorridos"
+
+        _fase_label = {
+            "consultando": "consultando status na Anthropic",
+            "pulado": "pulado — acima do limite de tamanho",
+            "em_processamento": "ainda em processamento na Anthropic",
+            "aplicando": "aplicando resultados",
+        }
+
+        def _on_lote(id_lote, i, total, fase):
+            log.write(f"Lote {i}/{total} ({id_lote}): {_fase_label.get(fase, fase)} — {_decorrido()}")
+            progress.progress(i / total)
 
         def _on_item_lote(nome_arquivo, status_label, i, total):
-            log.write(f"Aplicando resultados do lote... {i}/{total} — {nome_arquivo} ({status_label})")
+            log.write(f"Aplicando resultados do lote... {i}/{total} — {nome_arquivo} ({status_label}) — {_decorrido()}")
+            progress.progress(i / total)
+
+        def _on_pendencia(nome_arquivo, i, total):
+            log.write(f"Resolvendo fila de pendências... {i}/{total} — {nome_arquivo} — {_decorrido()}")
             progress.progress(i / total)
 
         with st.spinner("Consultando a Batch API e aplicando resultados (pode levar minutos em lotes grandes)..."):
-            resumo = process_pending_batches(on_item=_on_item_lote)
+            resumo = process_pending_batches(on_item=_on_item_lote, on_lote=_on_lote, on_pendencia=_on_pendencia)
         progress.empty()
         log.empty()
         if resumo:
@@ -1205,7 +1280,18 @@ with col1:
     st.subheader("Dados")
 with col2:
     if st.button("🔄 Tentar resolver fila pendente"):
-        resolvidos = retry_pending_queue()
+        progress = st.progress(0.0)
+        log = st.empty()
+        inicio = time.time()
+
+        def _on_pendencia_manual(nome_arquivo, i, total):
+            log.write(f"Verificando pendência... {i}/{total} — {nome_arquivo} — {time.time() - inicio:.0f}s decorridos")
+            progress.progress(i / total)
+
+        with st.spinner("Revarrendo a fila de pendências..."):
+            resolvidos = retry_pending_queue(on_pendencia=_on_pendencia_manual)
+        progress.empty()
+        log.empty()
         if resolvidos:
             st.success(f"Resolvido(s): {', '.join(resolvidos)}")
         else:
